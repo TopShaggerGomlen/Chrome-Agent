@@ -1,0 +1,9 @@
+node_modules/
+.env
+server/.env
+server/.runtime-secrets.json
+.runtime-secrets.json
+.DS_Store
+dist/
+build/
+*.log
