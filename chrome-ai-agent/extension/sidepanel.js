@@ -14,9 +14,11 @@ const taskInput = document.getElementById("task");
 const askBtn = document.getElementById("askBtn");
 const refreshBtn = document.getElementById("refreshBtn");
 const runBatchBtn = document.getElementById("runBatchBtn");
+const stopBtn = document.getElementById("stopBtn");
 const clearBtn = document.getElementById("clearBtn");
 const attachFileBtn = document.getElementById("attachFileBtn");
 const fileInput = document.getElementById("fileInput");
+const includeScreenshotInput = document.getElementById("includeScreenshot");
 const attachmentTray = document.getElementById("attachmentTray");
 const responseBox = document.getElementById("response");
 const actionsBox = document.getElementById("actions");
@@ -61,17 +63,20 @@ let attachedFiles = [];
 let nextAttachmentId = 1;
 let collectionPlaybookName = "";
 let collectionRun = createEmptyCollectionRun();
+let activeAbortController = null;
+let batchRunning = false;
 
 function setBusy(isBusy) {
   document.body.classList.toggle("is-busy", isBusy);
   document.body.setAttribute("aria-busy", String(isBusy));
   askBtn.disabled = isBusy;
   refreshBtn.disabled = isBusy;
-  runBatchBtn.disabled = isBusy;
+  runBatchBtn.disabled = isBusy || !executableActions(pendingActions).length;
   saveSettingsBtn.disabled = isBusy;
   codexLoginBtn.disabled = isBusy;
   codexCheckBtn.disabled = isBusy;
   attachFileBtn.disabled = isBusy;
+  stopBtn.disabled = !isBusy && !collectionRun.running && !batchRunning;
 }
 
 function appendResponse(text) {
@@ -216,6 +221,38 @@ function agentAttachments() {
   }));
 }
 
+function actionRiskLabel(action) {
+  return String(action?.riskLabel || action?.risk || "safe").toLowerCase();
+}
+
+function actionRiskReasons(action) {
+  if (Array.isArray(action?.riskReasons)) return action.riskReasons.filter(Boolean);
+  if (action?.reason) return [action.reason];
+  if (action?.riskReason) return [action.riskReason];
+  return [];
+}
+
+function normalizeActionForDisplay(item) {
+  const action = item?.action && typeof item.action === "object" ? item.action : item;
+  const riskLabel = actionRiskLabel(item?.riskLabel ? item : action);
+  const reasons = [
+    ...actionRiskReasons(action),
+    ...actionRiskReasons(item)
+  ];
+
+  return {
+    ...action,
+    riskLabel: riskLabel === "blocked" || riskLabel === "caution" ? riskLabel : "safe",
+    riskReasons: Array.from(new Set(reasons.map(reason => String(reason || "").trim()).filter(Boolean)))
+  };
+}
+
+function executableActions(actions) {
+  return (actions || [])
+    .map(normalizeActionForDisplay)
+    .filter(action => action.riskLabel !== "blocked");
+}
+
 function createEmptyCollectionRun() {
   return {
     running: false,
@@ -290,6 +327,7 @@ function setCollectionControls() {
   collectionDownloadBtn.disabled = collectionRun.rows.length === 0;
   collectionPlaybookBtn.disabled = collectionRun.running;
   collectionClearBtn.disabled = collectionRun.running;
+  stopBtn.disabled = !collectionRun.running && !activeAbortController && !batchRunning;
 }
 
 function rowKey(row) {
@@ -403,27 +441,19 @@ function renderCollectionRun() {
 }
 
 async function readCollectionSnapshot() {
-  const tab = await getActiveTab();
-
-  if (!tab || !tab.id) {
-    return { error: "No active tab found." };
-  }
-
-  const snapshot = await sendToContentScript(tab.id, {
-    type: "GET_COLLECTION_SNAPSHOT"
+  const result = await sendToBackground({
+    type: "GET_DEEP_PAGE_CONTEXT",
+    includeScreenshot: includeScreenshotInput.checked,
+    includeAccessibility: true
   });
 
-  if (snapshot.error) return snapshot;
+  if (result.error) return result;
 
   return {
-    tab,
+    tab: result.tab,
     snapshot: {
-      ...snapshot,
-      tab: {
-        id: tab.id,
-        url: tab.url,
-        title: tab.title
-      }
+      ...result.page,
+      tab: result.tab
     }
   };
 }
@@ -461,9 +491,10 @@ async function executeCollectionActions(tabId, actions) {
     addCollectionLog(`Action: ${JSON.stringify(action)}`);
     renderCollectionRun();
 
-    const result = await sendToContentScript(tabId, {
-      type: "RUN_COLLECTION_ACTION",
-      action
+    const result = await sendToBackground({
+      type: "RUN_PAGE_ACTION",
+      action,
+      collection: true
     });
 
     if (result?.error) {
@@ -655,6 +686,28 @@ function resetCollectionRun() {
   renderCollectionRun();
 }
 
+function stopCurrentWork() {
+  if (activeAbortController) {
+    activeAbortController.abort();
+    activeAbortController = null;
+  }
+
+  if (collectionRun.running) {
+    collectionRun.stopRequested = true;
+    setCollectionStatus("Stopping after the current step...");
+  }
+
+  if (batchRunning || taskPermissionGranted) {
+    taskPermissionGranted = false;
+    batchRunning = false;
+    appendResponse("Stopping current action batch...");
+  }
+
+  setBusy(false);
+  renderCollectionRun();
+  renderActions();
+}
+
 function renderActions() {
   if (!pendingActions.length) {
     actionsBox.style.display = "none";
@@ -662,6 +715,9 @@ function renderActions() {
     runBatchBtn.style.display = "none";
     return;
   }
+
+  const displayActions = pendingActions.map(normalizeActionForDisplay);
+  const runnableCount = executableActions(displayActions).length;
 
   actionsBox.style.display = "block";
   actionsBox.innerHTML = "";
@@ -674,13 +730,13 @@ function renderActions() {
 
   const count = document.createElement("span");
   count.className = "action-count";
-  count.textContent = String(pendingActions.length);
+  count.textContent = `${runnableCount}/${displayActions.length} runnable`;
 
   header.appendChild(label);
   header.appendChild(count);
   actionsBox.appendChild(header);
 
-  pendingActions.forEach((action, index) => {
+  displayActions.forEach((action, index) => {
     const div = document.createElement("div");
     div.className = "action-card";
 
@@ -694,18 +750,34 @@ function renderActions() {
     type.className = "action-type";
     type.textContent = action.type;
 
+    const risk = document.createElement("span");
+    risk.className = `risk-badge risk-${action.riskLabel}`;
+    risk.textContent = action.riskLabel;
+
     const pre = document.createElement("pre");
     pre.textContent = JSON.stringify(action, null, 2);
 
     title.appendChild(step);
     title.appendChild(type);
+    title.appendChild(risk);
     div.appendChild(title);
+
+    if (action.riskReasons.length) {
+      const meta = document.createElement("div");
+      meta.className = "action-meta";
+      meta.textContent = action.riskReasons.join(" ");
+      div.appendChild(meta);
+    }
+
     div.appendChild(pre);
     actionsBox.appendChild(div);
   });
 
   runBatchBtn.style.display = "inline-block";
-  runBatchBtn.textContent = `Grant Permission and Run Batch (${pendingActions.length})`;
+  runBatchBtn.disabled = !runnableCount || batchRunning;
+  runBatchBtn.textContent = runnableCount
+    ? `Grant Permission and Run Batch (${runnableCount})`
+    : "No Runnable Actions";
 }
 
 async function getActiveTab() {
@@ -727,24 +799,30 @@ async function sendToContentScript(tabId, message) {
   }
 }
 
-async function readCurrentPage() {
-  const tab = await getActiveTab();
-
-  if (!tab || !tab.id) {
-    return { error: "No active tab found." };
+async function sendToBackground(message) {
+  try {
+    return await chrome.runtime.sendMessage(message);
+  } catch (error) {
+    return {
+      error: error.message || "Could not communicate with the extension background worker."
+    };
   }
+}
 
-  const pageData = await sendToContentScript(tab.id, {
-    type: "GET_PAGE_CONTEXT"
+async function readCurrentPage() {
+  const result = await sendToBackground({
+    type: "GET_DEEP_PAGE_CONTEXT",
+    includeScreenshot: includeScreenshotInput.checked,
+    includeAccessibility: true
   });
 
-  if (pageData.error) {
-    return pageData;
+  if (result.error) {
+    return result;
   }
 
   latestPageData = {
-    tab,
-    pageData
+    tab: result.tab,
+    pageData: result.page
   };
 
   return latestPageData;
@@ -766,6 +844,129 @@ async function postJson(url, body) {
   }
 
   return data;
+}
+
+function applyAgentFinal(data) {
+  const executable = Array.isArray(data.actions) ? data.actions : [];
+  const blocked = Array.isArray(data.blockedActions)
+    ? data.blockedActions.map(item => normalizeActionForDisplay({
+      ...(item.action || item),
+      riskLabel: "blocked",
+      riskReasons: [
+        ...(Array.isArray(item.riskReasons) ? item.riskReasons : []),
+        item.reason || item.riskReason || ""
+      ].filter(Boolean)
+    }))
+    : [];
+
+  pendingActions = [
+    ...executable.map(normalizeActionForDisplay),
+    ...blocked
+  ];
+
+  const currentText = responseBox.textContent.trim();
+  const statusOnly = [
+    "Reading page context...",
+    "Streaming reply...",
+    "Planning actions...",
+    "Codex CLI mode does not stream tokens here. Planning actions..."
+  ].includes(currentText);
+
+  if (data.reply && (!currentText || statusOnly)) {
+    responseBox.textContent = data.reply;
+  }
+
+  if (Array.isArray(data.warnings) && data.warnings.length) {
+    appendResponse(`Warnings:\n${data.warnings.join("\n")}`);
+  }
+
+  renderActions();
+}
+
+function parseSseBlock(block) {
+  let event = "message";
+  const dataLines = [];
+
+  for (const line of block.split(/\r?\n/)) {
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim() || "message";
+    } else if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+
+  const dataText = dataLines.join("\n");
+  let data = {};
+
+  if (dataText) {
+    try {
+      data = JSON.parse(dataText);
+    } catch (error) {
+      data = { text: dataText };
+    }
+  }
+
+  return { event, data };
+}
+
+async function streamAgentRequest(payload) {
+  activeAbortController = new AbortController();
+  stopBtn.disabled = false;
+
+  const res = await fetch(`${API_BASE}/agent/stream`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload),
+    signal: activeAbortController.signal
+  });
+
+  if (!res.ok || !res.body) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Request failed: ${res.status}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let sawFinal = false;
+  let sawDelta = false;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+
+    const blocks = buffer.split(/\n\n/);
+    buffer = blocks.pop() || "";
+
+    for (const block of blocks) {
+      if (!block.trim()) continue;
+
+      const { event, data } = parseSseBlock(block);
+
+      if (event === "status") {
+        if (data.message && !sawDelta) responseBox.textContent = data.message;
+      } else if (event === "delta") {
+        if (!sawDelta) {
+          responseBox.textContent = "";
+          sawDelta = true;
+        }
+        responseBox.textContent += data.text || "";
+      } else if (event === "final") {
+        sawFinal = true;
+        applyAgentFinal(data);
+      } else if (event === "error") {
+        throw new Error(data.error || data.message || "Streaming request failed.");
+      }
+    }
+
+    if (done) break;
+  }
+
+  if (!sawFinal) {
+    throw new Error("Streaming ended before final actions were returned.");
+  }
 }
 
 async function getJson(url) {
@@ -1009,6 +1210,8 @@ collectionStopBtn.addEventListener("click", () => {
   renderCollectionRun();
 });
 
+stopBtn.addEventListener("click", stopCurrentWork);
+
 collectionApproveBtn.addEventListener("click", () => {
   collectionRun.firstRecordReviewed = true;
   collectionRun.pausedForReview = false;
@@ -1036,7 +1239,12 @@ refreshBtn.addEventListener("click", async () => {
     responseBox.textContent = result.error;
   } else {
     const count = result.pageData.elements?.length || 0;
-    responseBox.textContent = `Page read successfully. Found ${count} interactive elements.`;
+    const frameCount = result.pageData.frames?.length || 1;
+    const chunkCount = result.pageData.chunks?.length || 0;
+    const warningText = result.pageData.warnings?.length
+      ? `\nWarnings:\n${result.pageData.warnings.join("\n")}`
+      : "";
+    responseBox.textContent = `Page read successfully. Found ${count} interactive elements across ${frameCount} frame(s) and ${chunkCount} text chunk(s).${warningText}`;
   }
 
   setBusy(false);
@@ -1069,54 +1277,50 @@ askBtn.addEventListener("click", async () => {
   const { tab, pageData } = result;
   responseBox.textContent = "Thinking...";
 
+  if (Array.isArray(pageData.warnings) && pageData.warnings.length) {
+    responseBox.textContent = `Context warnings:\n${pageData.warnings.join("\n")}\n\nThinking...`;
+  }
+
   try {
-    const data = await postJson(`${API_BASE}/agent`, {
+    await streamAgentRequest({
       task,
       provider: providerSelect.value,
-      url: tab.url,
-      title: tab.title,
+      url: tab?.url || pageData.url,
+      title: tab?.title || pageData.title,
       page: pageData,
       files: agentAttachments()
     });
-
-    responseBox.textContent = data.reply || "No reply.";
-    pendingActions = Array.isArray(data.actions) ? data.actions : [];
-
-    if (Array.isArray(data.blockedActions) && data.blockedActions.length) {
-      appendResponse(`Blocked actions:\n${JSON.stringify(data.blockedActions, null, 2)}`);
-    }
-
-    renderActions();
   } catch (error) {
-    responseBox.textContent = `Could not complete request: ${error.message}. Make sure the backend is running on ${API_BASE}.`;
+    if (error.name === "AbortError") {
+      appendResponse("Stopped.");
+    } else {
+      responseBox.textContent = `Could not complete request: ${error.message}. Make sure the backend is running on ${API_BASE}.`;
+    }
+  } finally {
+    activeAbortController = null;
+    setBusy(false);
   }
-
-  setBusy(false);
 });
 
 runBatchBtn.addEventListener("click", async () => {
-  if (!pendingActions.length) {
+  if (!executableActions(pendingActions).length) {
     renderActions();
     return;
   }
 
   taskPermissionGranted = true;
+  batchRunning = true;
   setBusy(true);
   appendResponse("Permission granted once for this task batch. Running actions...");
 
-  const tab = await getActiveTab();
+  while (taskPermissionGranted) {
+    const nextIndex = pendingActions.findIndex(action => normalizeActionForDisplay(action).riskLabel !== "blocked");
+    if (nextIndex === -1) break;
 
-  if (!tab || !tab.id) {
-    appendResponse("No active tab found. Stopped.");
-    setBusy(false);
-    return;
-  }
+    const action = normalizeActionForDisplay(pendingActions.splice(nextIndex, 1)[0]);
 
-  while (pendingActions.length > 0 && taskPermissionGranted) {
-    const action = pendingActions.shift();
-
-    const result = await sendToContentScript(tab.id, {
-      type: "RUN_ACTION",
+    const result = await sendToBackground({
+      type: "RUN_PAGE_ACTION",
       action
     });
 
@@ -1129,11 +1333,13 @@ runBatchBtn.addEventListener("click", async () => {
     }
   }
 
+  batchRunning = false;
   renderActions();
   setBusy(false);
 });
 
 clearBtn.addEventListener("click", () => {
+  stopCurrentWork();
   pendingActions = [];
   executedActions = [];
   latestPageData = null;

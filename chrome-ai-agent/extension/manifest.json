@@ -3,12 +3,14 @@
   "name": "Chrome AI Agent",
   "version": "0.2.0",
   "description": "A browser AI agent that can read the current page and run approved task batches.",
-  "minimum_chrome_version": "116",
+  "minimum_chrome_version": "125",
   "permissions": [
     "activeTab",
+    "debugger",
     "scripting",
     "sidePanel",
-    "tabs"
+    "tabs",
+    "webNavigation"
   ],
   "host_permissions": [
     "<all_urls>",
@@ -27,7 +29,10 @@
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true
     }
   ]
 }

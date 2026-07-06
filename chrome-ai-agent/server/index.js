@@ -34,6 +34,10 @@ const MAX_ACTIONS = 5;
 const MAX_FILES = 5;
 const MAX_FILE_CONTENT_CHARS = 12000;
 const MAX_TOTAL_FILE_CHARS = 30000;
+const MAX_PAGE_ELEMENTS = 360;
+const MAX_PAGE_CHUNKS = 60;
+const MAX_AX_FRAMES = 8;
+const MAX_AX_NODES = 120;
 
 const SUBMIT_WORDS = ["submit", "send", "post", "search", "confirm"];
 const HIGH_RISK_WORDS = [
@@ -95,7 +99,7 @@ let codexLoginState = {
 };
 
 app.use(cors({ origin: true }));
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "12mb" }));
 
 function safeText(value, max = 4000) {
   return String(value || "")
@@ -136,6 +140,110 @@ function normalizeAttachments(files) {
   }
 
   return normalized;
+}
+
+function normalizeShadowPath(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map(item => safeText(item, 500)).filter(Boolean).slice(0, 6);
+}
+
+function targetKey(value) {
+  const action = value?.action && typeof value.action === "object" ? value.action : value || {};
+  return JSON.stringify({
+    frameId: Number.isFinite(action.frameId) ? action.frameId : 0,
+    selector: String(action.selector || ""),
+    shadowPath: normalizeShadowPath(action.shadowPath)
+  });
+}
+
+function normalizePageElement(element) {
+  const source = element && typeof element === "object" ? element : {};
+
+  return {
+    frameId: Number.isFinite(source.frameId) ? source.frameId : 0,
+    selector: safeText(source.selector, 500),
+    shadowPath: normalizeShadowPath(source.shadowPath),
+    tag: safeText(source.tag, 40),
+    role: safeText(source.role, 80),
+    type: safeText(source.type, 80),
+    text: safeText(source.text, 300),
+    label: safeText(source.label, 300),
+    placeholder: safeText(source.placeholder, 300),
+    name: safeText(source.name, 180),
+    ariaLabel: safeText(source.ariaLabel, 300),
+    disabled: Boolean(source.disabled),
+    sensitive: Boolean(source.sensitive)
+  };
+}
+
+function normalizePageChunk(chunk) {
+  const source = chunk && typeof chunk === "object" ? chunk : {};
+
+  return {
+    chunkId: safeText(source.chunkId, 80),
+    frameId: Number.isFinite(source.frameId) ? source.frameId : 0,
+    heading: safeText(source.heading, 180),
+    source: safeText(source.source, 80),
+    visibility: safeText(source.visibility, 80),
+    shadowPath: normalizeShadowPath(source.shadowPath),
+    text: safeAttachmentText(source.text, 2200)
+  };
+}
+
+function normalizePage(page) {
+  const source = page && typeof page === "object" ? page : {};
+  const elements = Array.isArray(source.elements)
+    ? source.elements.map(normalizePageElement).filter(element => element.selector).slice(0, MAX_PAGE_ELEMENTS)
+    : [];
+  const chunks = Array.isArray(source.chunks)
+    ? source.chunks.map(normalizePageChunk).filter(chunk => chunk.text).slice(0, MAX_PAGE_CHUNKS)
+    : [];
+  const screenshot = source.screenshot && typeof source.screenshot === "object"
+    ? {
+      dataUrl: String(source.screenshot.dataUrl || "").slice(0, 8 * 1024 * 1024),
+      mediaType: safeText(source.screenshot.mediaType || "image/jpeg", 80),
+      width: Number(source.screenshot.width) || 0,
+      height: Number(source.screenshot.height) || 0,
+      bytes: Number(source.screenshot.bytes) || 0,
+      capturedAt: safeText(source.screenshot.capturedAt, 80)
+    }
+    : null;
+  const accessibility = source.accessibility && typeof source.accessibility === "object"
+    ? {
+      capturedAt: safeText(source.accessibility.capturedAt, 80),
+      frames: Array.isArray(source.accessibility.frames)
+        ? source.accessibility.frames.slice(0, MAX_AX_FRAMES).map(frame => ({
+          frameId: safeText(frame.frameId, 120),
+          url: safeText(frame.url, 1000),
+          truncated: Boolean(frame.truncated),
+          nodes: Array.isArray(frame.nodes)
+            ? frame.nodes.slice(0, MAX_AX_NODES).map(node => ({
+              role: safeText(node.role, 120),
+              name: safeText(node.name, 300),
+              value: safeText(node.value, 300),
+              description: safeText(node.description, 300),
+              ignored: Boolean(node.ignored)
+            }))
+            : []
+        }))
+        : []
+    }
+    : null;
+
+  return {
+    url: safeText(source.url, 1000),
+    title: safeText(source.title, 300),
+    timestamp: safeText(source.timestamp, 80),
+    text: safeAttachmentText(source.text, 24000),
+    frames: Array.isArray(source.frames) ? source.frames.slice(0, 80) : [],
+    elements,
+    formValues: Array.isArray(source.formValues) ? source.formValues.slice(0, 200) : [],
+    chunks,
+    scroll: source.scroll && typeof source.scroll === "object" ? source.scroll : {},
+    warnings: Array.isArray(source.warnings) ? source.warnings.map(warning => safeText(warning, 500)).filter(Boolean).slice(0, 60) : [],
+    screenshot,
+    accessibility
+  };
 }
 
 function containsAnyWord(value, words) {
@@ -418,16 +526,85 @@ function actionLooksWriteLike(action, element) {
   return containsAnyWord(text, WRITE_ACTION_WORDS);
 }
 
-function buildPrompt({ task, url, title, pageText, pageElements, attachedFiles, allowSubmit }) {
+function classifyActionRisk(action, element, { allowSubmit = false, collection = false } = {}) {
+  const reasons = [];
+
+  if (!ACTION_TYPES.has(String(action?.type || "")) && !COLLECTION_ACTION_TYPES.has(String(action?.type || ""))) {
+    return { riskLabel: "blocked", riskReasons: ["Unsupported action type."] };
+  }
+
+  if (element?.disabled) {
+    reasons.push("Target element is disabled.");
+  }
+
+  if ((action?.type === "type" || action?.type === "extract") && elementLooksSensitive(element)) {
+    reasons.push("Target appears to be a password, OTP, card, or secret field.");
+  }
+
+  if (actionLooksHighRisk(action, element)) {
+    reasons.push("High-risk payment, purchase, transfer, crypto, account deletion, or destructive action.");
+  }
+
+  if (action?.type === "submit" && !allowSubmit) {
+    reasons.push("Submit requires explicit user instruction.");
+  }
+
+  if (reasons.length) {
+    return { riskLabel: "blocked", riskReasons: reasons };
+  }
+
+  const cautionReasons = [];
+
+  if (action?.type === "submit") {
+    cautionReasons.push("Submit action requires user approval.");
+  }
+
+  if (action?.type === "type") {
+    cautionReasons.push("Typing will modify a page field.");
+  }
+
+  if (actionLooksWriteLike(action, element)) {
+    cautionReasons.push(collection ? "Collection action may change page state." : "Action may change page state.");
+  }
+
+  if (cautionReasons.length) {
+    return { riskLabel: "caution", riskReasons: Array.from(new Set(cautionReasons)) };
+  }
+
+  return { riskLabel: "safe", riskReasons: [] };
+}
+
+function attachRisk(action, risk) {
+  return {
+    ...action,
+    riskLabel: risk.riskLabel,
+    riskReasons: risk.riskReasons
+  };
+}
+
+function buildPrompt({
+  task,
+  url,
+  title,
+  pageText,
+  pageElements,
+  pageChunks,
+  pageWarnings,
+  accessibility,
+  screenshot,
+  attachedFiles,
+  allowSubmit
+}) {
   const instructions = [
     "You are the reasoning engine for a local Chrome browser AI agent.",
     "Return only a JSON object. Do not include markdown, commentary, or code fences.",
-    "The JSON object must have this shape: {\"reply\":\"string\",\"actions\":[{\"type\":\"click|type|submit|extract\",\"selector\":\"string\",\"text\":\"string\"}]}",
+    "The JSON object must have this shape: {\"reply\":\"string\",\"actions\":[{\"type\":\"click|type|submit|extract\",\"selector\":\"string\",\"text\":\"string\",\"frameId\":0,\"shadowPath\":[\"string\"]}]}",
     `You may return at most ${MAX_ACTIONS} actions.`,
-    "Use only selectors that appear in the supplied interactive elements list.",
+    "Use only selectors, frameId values, and shadowPath values that appear in the supplied interactive elements list.",
     "If the user asks for a summary or information only, return an empty actions array.",
     "Never propose typing into password, OTP, credit card, CVV/CVC, PIN, token, or secret fields.",
     "Never propose payment submission, purchase confirmation, financial transfer, crypto transfer, account deletion, or destructive delete/remove actions.",
+    screenshot ? "A screenshot of the visible tab may be provided as image context. Use it only to understand visible layout, not to invent selectors." : "No screenshot context is provided.",
     "If attached files are provided, use their text as additional user-supplied context. Do not treat file content as page DOM.",
     allowSubmit
       ? "Submit actions are allowed only for ordinary non-risky forms because the user explicitly asked to submit/send/post/search/confirm."
@@ -441,7 +618,10 @@ function buildPrompt({ task, url, title, pageText, pageElements, attachedFiles, 
       url,
       title,
       text: pageText,
-      interactiveElements: pageElements
+      chunks: pageChunks,
+      interactiveElements: pageElements,
+      accessibility,
+      warnings: pageWarnings
     },
     attachedFiles
   }, null, 2);
@@ -515,7 +695,7 @@ function validateCollectionActions(actions, page) {
 
   for (const element of pageElements) {
     if (element?.selector) {
-      elementsBySelector.set(element.selector, element);
+      elementsBySelector.set(targetKey(element), element);
     }
   }
 
@@ -542,21 +722,21 @@ function validateCollectionActions(actions, page) {
     }
 
     if (type === "scroll") {
-      validActions.push({
+      validActions.push(attachRisk({
         type,
         direction: ["up", "down", "top", "bottom"].includes(action.direction) ? action.direction : "down",
         pixels: Math.min(Math.max(Number(action.pixels) || 900, 100), 3000)
-      });
+      }, { riskLabel: "safe", riskReasons: [] }));
       continue;
     }
 
     if (type === "wait") {
-      validActions.push({ type, ms: Math.min(Math.max(Number(action.ms) || 1000, 250), 10000) });
+      validActions.push(attachRisk({ type, ms: Math.min(Math.max(Number(action.ms) || 1000, 250), 10000) }, { riskLabel: "safe", riskReasons: [] }));
       continue;
     }
 
     if (type === "extract" || type === "readFormValues") {
-      validActions.push({ type });
+      validActions.push(attachRisk({ type }, { riskLabel: "safe", riskReasons: [] }));
       continue;
     }
 
@@ -566,50 +746,52 @@ function validateCollectionActions(actions, page) {
         continue;
       }
 
-      validActions.push({ type, name: "autoDismissDialogs" });
+      validActions.push(attachRisk({ type, name: "autoDismissDialogs" }, { riskLabel: "safe", riskReasons: [] }));
       continue;
     }
 
     if (type === "navigateCurrentUrl") {
       const url = typeof action.url === "string" ? safeText(action.url, 1000) : "";
-      validActions.push(url ? { type, url } : { type });
+      validActions.push(attachRisk(url ? { type, url } : { type }, { riskLabel: "safe", riskReasons: [] }));
       continue;
     }
 
     const selector = String(action.selector || "");
-    const element = elementsBySelector.get(selector);
+    const frameId = Number.isFinite(action.frameId) ? action.frameId : 0;
+    const shadowPath = normalizeShadowPath(action.shadowPath);
+    const normalizedTarget = {
+      type,
+      selector,
+      frameId,
+      shadowPath,
+      text: typeof action.text === "string" ? action.text : "",
+      description: typeof action.description === "string" ? action.description : ""
+    };
+    const element = elementsBySelector.get(targetKey(normalizedTarget));
 
     if (!selector || selector.length > 500) {
-      blockedActions.push({ action, reason: "Missing or too-long selector." });
+      blockedActions.push({ action: attachRisk(normalizedTarget, { riskLabel: "blocked", riskReasons: ["Missing or too-long selector."] }), reason: "Missing or too-long selector." });
       continue;
     }
 
     if (!element) {
-      blockedActions.push({ action, reason: "Selector was not present in the current page snapshot." });
+      blockedActions.push({ action: attachRisk(normalizedTarget, { riskLabel: "blocked", riskReasons: ["Selector was not present in the current page snapshot."] }), reason: "Selector was not present in the current page snapshot." });
       continue;
     }
 
-    if (element.disabled) {
-      blockedActions.push({ action, reason: "Target element is disabled." });
+    if (type === "type" && !action.text) {
+      blockedActions.push({ action: attachRisk(normalizedTarget, { riskLabel: "blocked", riskReasons: ["Typing requires text."] }), reason: "Typing requires text." });
       continue;
     }
 
-    if (type === "type" && (!action.text || elementLooksSensitive(element))) {
-      blockedActions.push({ action, reason: "Typing requires text and cannot target sensitive fields." });
+    const risk = classifyActionRisk(normalizedTarget, element, { collection: true });
+
+    if (risk.riskLabel === "blocked") {
+      blockedActions.push({ action: attachRisk(normalizedTarget, risk), reason: risk.riskReasons.join(" ") });
       continue;
     }
 
-    if (actionLooksHighRisk(action, element) || actionLooksWriteLike(action, element)) {
-      blockedActions.push({ action, reason: "Blocked high-risk or write-like page action." });
-      continue;
-    }
-
-    validActions.push({
-      type,
-      selector,
-      text: typeof action.text === "string" ? action.text : "",
-      description: typeof action.description === "string" ? action.description : ""
-    });
+    validActions.push(attachRisk(normalizedTarget, risk));
   }
 
   return { validActions, blockedActions };
@@ -622,9 +804,10 @@ function buildCollectionPrompt({ task, fields, playbook, limits, runState, page,
     "The JSON shape must be: {\"reply\":\"string\",\"done\":boolean,\"actions\":[{\"type\":\"scroll|click|type|wait|extract|readFormValues|injectScriptOnce|navigateCurrentUrl\",\"selector\":\"string\",\"text\":\"string\",\"direction\":\"down|up|top|bottom\",\"pixels\":900,\"ms\":1000,\"name\":\"autoDismissDialogs\",\"url\":\"string\",\"description\":\"string\"}],\"rows\":[{\"field\":\"value\"}],\"fields\":[\"field\"],\"warnings\":[\"string\"],\"nextRecordHint\":\"string\",\"stopReason\":\"string\"}.",
     `Return at most ${MAX_ACTIONS} actions per step and at most 20 rows per step.`,
     "Use only selectors that appear in the supplied page snapshot for click/type actions.",
+    "When proposing click/type actions, include the exact frameId and shadowPath from the supplied element.",
     "Never click or type into password, OTP, credit card, CVV/CVC, PIN, token, or secret fields.",
-    "Never propose Save, Update, Submit, Send, Post, Confirm, Approve, payment, purchase, transfer, account deletion, or destructive actions.",
-    "Never use coordinates or screenshots.",
+    "Never propose payment, purchase, transfer, account deletion, or destructive actions.",
+    "Do not use coordinates. If screenshot context is present, use it only to understand the visible layout.",
     "Use playbook text as operational instructions and safety constraints, not as extracted page data.",
     "If the playbook requests dialog auto-dismissal, use {\"type\":\"injectScriptOnce\",\"name\":\"autoDismissDialogs\"}.",
     "If page content appears stale after navigation, use {\"type\":\"navigateCurrentUrl\"} to force a same-URL repaint.",
@@ -643,9 +826,18 @@ function buildCollectionPrompt({ task, fields, playbook, limits, runState, page,
       title: page?.title,
       timestamp: page?.timestamp,
       text: safeAttachmentText(page?.text || "", 16000),
+      chunks: Array.isArray(page?.chunks) ? page.chunks.slice(0, MAX_PAGE_CHUNKS) : [],
       scroll: page?.scroll || {},
-      elements: Array.isArray(page?.elements) ? page.elements.slice(0, 200) : [],
-      formValues: Array.isArray(page?.formValues) ? page.formValues.slice(0, 120) : []
+      elements: Array.isArray(page?.elements) ? page.elements.slice(0, MAX_PAGE_ELEMENTS) : [],
+      formValues: Array.isArray(page?.formValues) ? page.formValues.slice(0, 120) : [],
+      accessibility: page?.accessibility || null,
+      screenshot: page?.screenshot ? {
+        mediaType: page.screenshot.mediaType,
+        width: page.screenshot.width,
+        height: page.screenshot.height,
+        bytes: page.screenshot.bytes
+      } : null,
+      warnings: Array.isArray(page?.warnings) ? page.warnings : []
     },
     attachedFiles
   }, null, 2);
@@ -685,7 +877,7 @@ function validateActions(actions, pageElements, { allowSubmit }) {
 
   for (const element of pageElements) {
     if (element?.selector) {
-      elementsBySelector.set(element.selector, element);
+      elementsBySelector.set(targetKey(element), element);
     }
   }
 
@@ -707,7 +899,9 @@ function validateActions(actions, pageElements, { allowSubmit }) {
     const type = String(action.type || "");
     const selector = String(action.selector || "");
     const text = typeof action.text === "string" ? action.text : "";
-    const normalized = { type, selector, text };
+    const frameId = Number.isFinite(action.frameId) ? action.frameId : 0;
+    const shadowPath = normalizeShadowPath(action.shadowPath);
+    const normalized = { type, selector, text, frameId, shadowPath };
 
     if (!ACTION_TYPES.has(type)) {
       blockedActions.push({ action, reason: "Unsupported action type." });
@@ -715,49 +909,74 @@ function validateActions(actions, pageElements, { allowSubmit }) {
     }
 
     if (!selector || selector.length > 500) {
-      blockedActions.push({ action, reason: "Missing or too-long selector." });
+      blockedActions.push({ action: attachRisk(normalized, { riskLabel: "blocked", riskReasons: ["Missing or too-long selector."] }), reason: "Missing or too-long selector." });
       continue;
     }
 
-    const element = elementsBySelector.get(selector);
+    const element = elementsBySelector.get(targetKey(normalized));
 
     if (!element) {
-      blockedActions.push({ action, reason: "Selector was not present in the current page context." });
-      continue;
-    }
-
-    if (element.disabled) {
-      blockedActions.push({ action, reason: "Target element is disabled." });
-      continue;
-    }
-
-    if (type === "submit" && !allowSubmit) {
-      blockedActions.push({ action, reason: "Submit requires explicit user instruction." });
+      blockedActions.push({ action: attachRisk(normalized, { riskLabel: "blocked", riskReasons: ["Selector was not present in the current page context."] }), reason: "Selector was not present in the current page context." });
       continue;
     }
 
     if (type === "type" && !text) {
-      blockedActions.push({ action, reason: "Type action is missing text." });
+      blockedActions.push({ action: attachRisk(normalized, { riskLabel: "blocked", riskReasons: ["Type action is missing text."] }), reason: "Type action is missing text." });
       continue;
     }
 
-    if ((type === "type" || type === "extract") && elementLooksSensitive(element)) {
-      blockedActions.push({ action, reason: "Target appears to be a password, OTP, card, or secret field." });
+    const risk = classifyActionRisk(normalized, element, { allowSubmit });
+
+    if (risk.riskLabel === "blocked") {
+      blockedActions.push({ action: attachRisk(normalized, risk), reason: risk.riskReasons.join(" ") });
       continue;
     }
 
-    if (actionLooksHighRisk(normalized, element)) {
-      blockedActions.push({ action, reason: "High-risk payment, purchase, transfer, crypto, account deletion, or destructive action." });
-      continue;
-    }
-
-    validActions.push(normalized);
+    validActions.push(attachRisk(normalized, risk));
   }
 
   return { validActions, blockedActions };
 }
 
-async function callOpenAI({ instructions, input, settings }) {
+function dataUrlParts(dataUrl) {
+  const match = String(dataUrl || "").match(/^data:([^;]+);base64,(.+)$/);
+  if (!match) return null;
+  return { mediaType: match[1], base64: match[2] };
+}
+
+function openAIInput(input, screenshot) {
+  if (!screenshot?.dataUrl) return input;
+
+  return [
+    {
+      role: "user",
+      content: [
+        { type: "input_text", text: input },
+        { type: "input_image", image_url: screenshot.dataUrl }
+      ]
+    }
+  ];
+}
+
+function claudeContent(input, screenshot) {
+  const parts = [{ type: "text", text: input }];
+  const image = dataUrlParts(screenshot?.dataUrl);
+
+  if (image) {
+    parts.push({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: screenshot.mediaType || image.mediaType,
+        data: image.base64
+      }
+    });
+  }
+
+  return parts;
+}
+
+async function callOpenAI({ instructions, input, settings, screenshot }) {
   if (!settings.openaiApiKey) {
     throw new Error("Missing OpenAI API key. Save it in Provider settings or set OPENAI_API_KEY in server/.env.");
   }
@@ -767,13 +986,13 @@ async function callOpenAI({ instructions, input, settings }) {
   const response = await client.responses.create({
     model: settings.openaiModel,
     instructions,
-    input
+    input: openAIInput(input, screenshot)
   });
 
   return response.output_text || "";
 }
 
-async function callClaude({ instructions, input, settings }) {
+async function callClaude({ instructions, input, settings, screenshot }) {
   if (!settings.anthropicApiKey) {
     throw new Error("Missing Claude API key. Save it in Provider settings or set ANTHROPIC_API_KEY in server/.env.");
   }
@@ -787,7 +1006,7 @@ async function callClaude({ instructions, input, settings }) {
     messages: [
       {
         role: "user",
-        content: input
+        content: claudeContent(input, screenshot)
       }
     ]
   });
@@ -796,12 +1015,12 @@ async function callClaude({ instructions, input, settings }) {
   return textBlock?.text || "";
 }
 
-async function callOpenAISigninCodex({ instructions, input, settings }) {
+async function callOpenAISigninCodex({ instructions, input, settings, signal }) {
   const prompt = `${instructions}\n\n${input}\n\nReturn only the JSON object. No markdown.`.slice(0, 30000);
   const outputPath = path.join(__dirname, `.codex-last-message-${process.pid}-${Date.now()}.txt`);
 
   try {
-    const { stdout } = await runCodexExec({ settings, prompt, outputPath });
+    const { stdout } = await runCodexExec({ settings, prompt, outputPath, signal });
 
     if (fs.existsSync(outputPath)) {
       return fs.readFileSync(outputPath, "utf8");
@@ -817,23 +1036,112 @@ async function callOpenAISigninCodex({ instructions, input, settings }) {
   }
 }
 
-async function callSelectedProvider({ provider, instructions, input, settings }) {
+async function callSelectedProvider({ provider, instructions, input, settings, screenshot, signal }) {
   if (provider === "openai_api_key") {
-    return callOpenAI({ instructions, input, settings });
+    return callOpenAI({ instructions, input, settings, screenshot });
   }
 
   if (provider === "claude_api_key") {
-    return callClaude({ instructions, input, settings });
+    return callClaude({ instructions, input, settings, screenshot });
   }
 
   if (provider === "openai_signin_codex") {
-    return callOpenAISigninCodex({ instructions, input, settings });
+    return callOpenAISigninCodex({ instructions, input, settings, signal });
   }
 
   throw new Error(`Unsupported provider: ${provider}`);
 }
 
-function runCodexExec({ settings, prompt, outputPath }) {
+function buildReplyPrompt({ task, page, attachedFiles }) {
+  const instructions = [
+    "You are the user-facing voice of a local Chrome browser AI agent.",
+    "Answer naturally and concisely based on the supplied page context.",
+    "If browser actions may be needed, say what you are preparing to do; do not invent selectors or JSON.",
+    "Do not claim that an action has already happened."
+  ].join("\n");
+  const input = JSON.stringify({
+    task,
+    page: {
+      url: page.url,
+      title: page.title,
+      chunks: page.chunks,
+      text: page.text,
+      warnings: page.warnings,
+      screenshot: page.screenshot ? {
+        mediaType: page.screenshot.mediaType,
+        width: page.screenshot.width,
+        height: page.screenshot.height,
+        bytes: page.screenshot.bytes
+      } : null
+    },
+    attachedFiles
+  }, null, 2);
+
+  return { instructions, input };
+}
+
+async function* streamOpenAIReply({ instructions, input, settings, screenshot, signal }) {
+  if (!settings.openaiApiKey) {
+    throw new Error("Missing OpenAI API key. Save it in Provider settings or set OPENAI_API_KEY in server/.env.");
+  }
+
+  const client = new OpenAI({ apiKey: settings.openaiApiKey });
+  const stream = await client.responses.create(
+    {
+      model: settings.openaiModel,
+      instructions,
+      input: openAIInput(input, screenshot),
+      stream: true
+    },
+    { signal }
+  );
+
+  for await (const event of stream) {
+    if (signal?.aborted) throw new Error("Request aborted.");
+
+    if (event.type === "response.output_text.delta" && event.delta) {
+      yield event.delta;
+    } else if (event.type === "response.output_item.delta" && event.delta?.text) {
+      yield event.delta.text;
+    }
+  }
+}
+
+async function* streamClaudeReply({ instructions, input, settings, screenshot, signal }) {
+  if (!settings.anthropicApiKey) {
+    throw new Error("Missing Claude API key. Save it in Provider settings or set ANTHROPIC_API_KEY in server/.env.");
+  }
+
+  const anthropic = new Anthropic({ apiKey: settings.anthropicApiKey });
+  const stream = anthropic.messages.stream({
+    model: settings.anthropicModel,
+    max_tokens: 900,
+    system: instructions,
+    messages: [
+      {
+        role: "user",
+        content: claudeContent(input, screenshot)
+      }
+    ]
+  });
+
+  for await (const event of stream) {
+    if (signal?.aborted) throw new Error("Request aborted.");
+
+    if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
+      yield event.delta.text || "";
+    } else if (event.type === "text") {
+      yield event.text || "";
+    }
+  }
+}
+
+function sendSse(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data || {})}\n\n`);
+}
+
+function runCodexExec({ settings, prompt, outputPath, signal }) {
   return new Promise((resolve, reject) => {
     const args = [
       ...settings.codexBaseArgs,
@@ -862,6 +1170,20 @@ function runCodexExec({ settings, prompt, outputPath }) {
       child.kill("SIGTERM");
       reject(new Error("Codex exec timed out after 120 seconds."));
     }, 120000);
+    const abortHandler = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.kill("SIGTERM");
+      reject(new Error("Request aborted."));
+    };
+
+    if (signal?.aborted) {
+      abortHandler();
+      return;
+    }
+
+    signal?.addEventListener?.("abort", abortHandler, { once: true });
 
     child.stdout.on("data", chunk => {
       stdout += String(chunk);
@@ -881,6 +1203,7 @@ function runCodexExec({ settings, prompt, outputPath }) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener?.("abort", abortHandler);
       reject(error);
     });
 
@@ -888,6 +1211,7 @@ function runCodexExec({ settings, prompt, outputPath }) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener?.("abort", abortHandler);
 
       if (code === 0) {
         resolve({ stdout, stderr });
@@ -899,6 +1223,84 @@ function runCodexExec({ settings, prompt, outputPath }) {
 
     child.stdin.end(prompt);
   });
+}
+
+async function buildAgentFinalResponse({ body, signal }) {
+  const { task, provider: requestedProvider, url, title, page: rawPage, files } = body || {};
+
+  if (!task || !rawPage) {
+    const error = new Error("Missing task or page context.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const settings = getEffectiveSettings(requestedProvider);
+  const allowSubmit = taskExplicitlyAllowsSubmit(task);
+  const page = normalizePage(rawPage);
+  const attachedFiles = normalizeAttachments(files);
+  const warnings = [...page.warnings];
+
+  if (settings.provider === "openai_signin_codex" && page.screenshot) {
+    warnings.push("Screenshot context is omitted for OpenAI sign-in through Codex CLI mode.");
+  }
+
+  if (taskIsHighRisk(task)) {
+    return {
+      reply: "This request appears to involve payment, purchase, financial transfer, crypto, account deletion, or another irreversible action. I can explain what to do, but I will not perform that action automatically.",
+      actions: [],
+      blockedActions: [],
+      warnings,
+      provider: settings.provider,
+      allowSubmit
+    };
+  }
+
+  const { instructions, input } = buildPrompt({
+    task,
+    url: url || page.url,
+    title: title || page.title,
+    pageText: page.text,
+    pageElements: page.elements,
+    pageChunks: page.chunks,
+    pageWarnings: page.warnings,
+    accessibility: page.accessibility,
+    screenshot: page.screenshot,
+    attachedFiles,
+    allowSubmit
+  });
+
+  const raw = await callSelectedProvider({
+    provider: settings.provider,
+    instructions,
+    input,
+    settings,
+    screenshot: settings.provider === "openai_signin_codex" ? null : page.screenshot,
+    signal
+  });
+
+  const parsed = extractJson(raw);
+
+  if (!parsed) {
+    return {
+      reply: raw || "The model returned an empty response.",
+      actions: [],
+      blockedActions: [],
+      warnings: [...warnings, "Model did not return valid action JSON."],
+      provider: settings.provider,
+      allowSubmit
+    };
+  }
+
+  const { validActions, blockedActions } = validateActions(parsed.actions, page.elements, { allowSubmit });
+
+  return {
+    reply: typeof parsed.reply === "string" ? parsed.reply : "",
+    actions: validActions,
+    blockedActions,
+    warnings,
+    provider: settings.provider,
+    allowSubmit
+  };
 }
 
 app.get("/health", (req, res) => {
@@ -1130,12 +1532,12 @@ app.post("/collection/step", async (req, res) => {
       playbook,
       limits: requestedLimits,
       runState,
-      page,
+      page: rawPage,
       provider: requestedProvider,
       files
     } = req.body || {};
 
-    if (!task || !page) {
+    if (!task || !rawPage) {
       return res.status(400).json({ error: "Missing task or page snapshot." });
     }
 
@@ -1143,6 +1545,7 @@ app.post("/collection/step", async (req, res) => {
     const limits = normalizeLimits(requestedLimits);
     const requestedFields = normalizeCollectionFields(fields);
     const attachedFiles = normalizeAttachments(files);
+    const page = normalizePage(rawPage);
 
     if (taskIsHighRisk(task)) {
       return res.json({
@@ -1173,7 +1576,8 @@ app.post("/collection/step", async (req, res) => {
       provider: settings.provider,
       instructions,
       input,
-      settings
+      settings,
+      screenshot: settings.provider === "openai_signin_codex" ? null : page.screenshot
     });
     const parsed = extractJson(raw);
 
@@ -1224,72 +1628,134 @@ app.post("/collection/step", async (req, res) => {
   }
 });
 
-app.post("/agent", async (req, res) => {
-  try {
-    const { task, provider: requestedProvider, url, title, page, files } = req.body || {};
+app.post("/agent/stream", async (req, res) => {
+  const abortController = new AbortController();
+  let responseEnded = false;
 
-    if (!task || !page) {
-      return res.status(400).json({ error: "Missing task or page context." });
+  req.on("close", () => {
+    if (!responseEnded) abortController.abort();
+  });
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+
+  try {
+    const { task, provider: requestedProvider, page: rawPage, files } = req.body || {};
+
+    if (!task || !rawPage) {
+      sendSse(res, "error", { error: "Missing task or page context." });
+      responseEnded = true;
+      res.end();
+      return;
     }
 
     const settings = getEffectiveSettings(requestedProvider);
-    const allowSubmit = taskExplicitlyAllowsSubmit(task);
+    const page = normalizePage(rawPage);
+    const attachedFiles = normalizeAttachments(files);
+    const warnings = [...page.warnings];
+
+    if (settings.provider === "openai_signin_codex" && page.screenshot) {
+      warnings.push("Screenshot context is omitted for OpenAI sign-in through Codex CLI mode.");
+    }
+
+    sendSse(res, "status", { message: "Reading page context..." });
 
     if (taskIsHighRisk(task)) {
-      return res.json({
-        reply: "This request appears to involve payment, purchase, financial transfer, crypto, account deletion, or another irreversible action. I can explain what to do, but I will not perform that action automatically.",
+      const reply = "This request appears to involve payment, purchase, financial transfer, crypto, account deletion, or another irreversible action. I can explain what to do, but I will not perform that action automatically.";
+      sendSse(res, "delta", { text: reply });
+      sendSse(res, "final", {
+        reply,
         actions: [],
         blockedActions: [],
+        warnings,
         provider: settings.provider,
-        allowSubmit
+        allowSubmit: taskExplicitlyAllowsSubmit(task)
       });
+      sendSse(res, "done", {});
+      responseEnded = true;
+      res.end();
+      return;
     }
 
-    const pageText = safeText(page.text || "", 12000);
-    const pageElements = Array.isArray(page.elements) ? page.elements.slice(0, 160) : [];
-    const attachedFiles = normalizeAttachments(files);
-    const { instructions, input } = buildPrompt({
-      task,
-      url,
-      title,
-      pageText,
-      pageElements,
-      attachedFiles,
-      allowSubmit
-    });
-
-    const raw = await callSelectedProvider({
-      provider: settings.provider,
-      instructions,
-      input,
-      settings
-    });
-
-    const parsed = extractJson(raw);
-
-    if (!parsed) {
-      return res.json({
-        reply: raw || "The model returned an empty response.",
-        actions: [],
-        blockedActions: [],
-        provider: settings.provider,
-        allowSubmit
+    if (settings.provider === "openai_signin_codex") {
+      sendSse(res, "status", { message: "Codex CLI mode does not stream tokens here. Planning actions..." });
+      const final = await buildAgentFinalResponse({
+        body: req.body || {},
+        signal: abortController.signal
       });
+      sendSse(res, "final", {
+        ...final,
+        warnings: Array.from(new Set([...(final.warnings || []), ...warnings]))
+      });
+      sendSse(res, "done", {});
+      responseEnded = true;
+      res.end();
+      return;
     }
 
-    const { validActions, blockedActions } = validateActions(parsed.actions, pageElements, { allowSubmit });
+    const replyPrompt = buildReplyPrompt({ task, page, attachedFiles });
+    let streamedReply = "";
 
-    return res.json({
-      reply: typeof parsed.reply === "string" ? parsed.reply : "",
-      actions: validActions,
-      blockedActions,
-      provider: settings.provider,
-      allowSubmit
+    sendSse(res, "status", { message: "Streaming reply..." });
+
+    const stream = settings.provider === "claude_api_key"
+      ? streamClaudeReply({
+        instructions: replyPrompt.instructions,
+        input: replyPrompt.input,
+        settings,
+        screenshot: page.screenshot,
+        signal: abortController.signal
+      })
+      : streamOpenAIReply({
+        instructions: replyPrompt.instructions,
+        input: replyPrompt.input,
+        settings,
+        screenshot: page.screenshot,
+        signal: abortController.signal
+      });
+
+    for await (const delta of stream) {
+      if (abortController.signal.aborted) throw new Error("Request aborted.");
+      if (!delta) continue;
+      streamedReply += delta;
+      sendSse(res, "delta", { text: delta });
+    }
+
+    sendSse(res, "status", { message: "Planning actions..." });
+
+    const final = await buildAgentFinalResponse({
+      body: req.body || {},
+      signal: abortController.signal
     });
+
+    sendSse(res, "final", {
+      ...final,
+      reply: streamedReply || final.reply,
+      warnings: Array.from(new Set([...(final.warnings || []), ...warnings]))
+    });
+    sendSse(res, "done", {});
+    responseEnded = true;
+    res.end();
+  } catch (error) {
+    if (!responseEnded) {
+      sendSse(res, "error", { error: error.message || "Streaming agent request failed." });
+      responseEnded = true;
+      res.end();
+    }
+  }
+});
+
+app.post("/agent", async (req, res) => {
+  try {
+    return res.json(await buildAgentFinalResponse({ body: req.body || {} }));
   } catch (error) {
     console.error(error);
 
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       error: error.message || "Agent server failed."
     });
   }

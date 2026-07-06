@@ -1,6 +1,9 @@
-const MAX_TEXT_CHARS = 12000;
-const MAX_ELEMENTS = 160;
-const MAX_FORM_VALUES = 120;
+const MAX_TEXT_CHARS = 24000;
+const MAX_CHUNKS = 28;
+const MAX_CHUNK_CHARS = 1800;
+const MAX_ELEMENTS = 220;
+const MAX_FORM_VALUES = 160;
+const MAX_SHADOW_DEPTH = 5;
 
 const INTERACTIVE_SELECTOR = [
   "a[href]",
@@ -18,6 +21,8 @@ const INTERACTIVE_SELECTOR = [
   "[contenteditable='true']",
   "[tabindex]:not([tabindex='-1'])"
 ].join(",");
+
+const FORM_SELECTOR = "input, textarea, select, [contenteditable='true']";
 
 const SENSITIVE_WORDS = [
   "password",
@@ -95,48 +100,32 @@ function isVisible(el) {
   return rect.width > 0 && rect.height > 0;
 }
 
-function getVisibleText() {
-  if (!document.body) return "";
-
-  const walker = document.createTreeWalker(
-    document.body,
-    NodeFilter.SHOW_TEXT,
-    {
-      acceptNode(node) {
-        const text = node.textContent.trim();
-        if (!text) return NodeFilter.FILTER_REJECT;
-
-        const parent = node.parentElement;
-        if (!parent || !isVisible(parent)) return NodeFilter.FILTER_REJECT;
-
-        return NodeFilter.FILTER_ACCEPT;
-      }
-    }
-  );
-
-  const chunks = [];
-  let length = 0;
-
-  while (walker.nextNode()) {
-    const text = cleanText(walker.currentNode.textContent, 1000);
-    if (!text) continue;
-
-    chunks.push(text);
-    length += text.length + 1;
-
-    if (length > MAX_TEXT_CHARS) break;
-  }
-
-  return chunks.join("\n").slice(0, MAX_TEXT_CHARS);
+function rootDocument(root) {
+  if (root instanceof Document) return root;
+  return root.ownerDocument || document;
 }
 
 function cssAttrValue(value) {
   return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-function buildSelector(el) {
+function queryAllInRoot(root, selector) {
+  try {
+    return Array.from(root.querySelectorAll(selector));
+  } catch (error) {
+    return [];
+  }
+}
+
+function buildSelectorInRoot(el, root = document) {
   if (el.id) {
-    return `#${CSS.escape(el.id)}`;
+    const selector = `#${CSS.escape(el.id)}`;
+
+    try {
+      if (root.querySelectorAll(selector).length === 1) return selector;
+    } catch (error) {
+      // Fall back to a path selector.
+    }
   }
 
   const stableAttributes = ["data-testid", "data-test", "data-qa", "name", "aria-label"];
@@ -147,9 +136,9 @@ function buildSelector(el) {
       const selector = `${el.tagName.toLowerCase()}[${attr}="${cssAttrValue(value)}"]`;
 
       try {
-        if (document.querySelectorAll(selector).length === 1) return selector;
+        if (root.querySelectorAll(selector).length === 1) return selector;
       } catch (error) {
-        // Fall back to the path selector below.
+        // Fall back to a path selector.
       }
     }
   }
@@ -157,11 +146,11 @@ function buildSelector(el) {
   const parts = [];
   let current = el;
 
-  while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 5) {
+  while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 7) {
     let part = current.tagName.toLowerCase();
     const parent = current.parentElement;
 
-    if (!parent) {
+    if (!parent || parent === root) {
       parts.unshift(part);
       break;
     }
@@ -177,7 +166,7 @@ function buildSelector(el) {
 
     const selector = parts.join(" > ");
     try {
-      if (document.querySelectorAll(selector).length === 1) return selector;
+      if (root.querySelectorAll(selector).length === 1) return selector;
     } catch (error) {
       break;
     }
@@ -186,13 +175,14 @@ function buildSelector(el) {
   return parts.join(" > ");
 }
 
-function getAssociatedLabel(el) {
+function getAssociatedLabel(el, root = document) {
   if (el.labels && el.labels.length) {
     return cleanText(Array.from(el.labels).map(label => label.innerText).join(" "));
   }
 
   if (el.id) {
-    const label = document.querySelector(`label[for="${cssAttrValue(el.id)}"]`);
+    const label = root.querySelector?.(`label[for="${cssAttrValue(el.id)}"]`) ||
+      rootDocument(root).querySelector(`label[for="${cssAttrValue(el.id)}"]`);
     if (label) return cleanText(label.innerText);
   }
 
@@ -202,15 +192,15 @@ function getAssociatedLabel(el) {
   return "";
 }
 
-function getElementText(el) {
+function getElementText(el, root = document) {
   if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-    return cleanText(el.placeholder || el.getAttribute("aria-label") || getAssociatedLabel(el));
+    return cleanText(el.placeholder || el.getAttribute("aria-label") || getAssociatedLabel(el, root));
   }
 
   return cleanText(el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title"));
 }
 
-function isSensitiveElement(el) {
+function isSensitiveElement(el, root = document) {
   const inputType = (el.getAttribute("type") || "").toLowerCase();
 
   if (inputType === "password") return true;
@@ -222,42 +212,140 @@ function isSensitiveElement(el) {
     el.getAttribute("id"),
     el.getAttribute("placeholder"),
     el.getAttribute("aria-label"),
-    getAssociatedLabel(el)
+    getAssociatedLabel(el, root)
   ].join(" ").toLowerCase();
 
   return SENSITIVE_WORDS.some(word => haystack.includes(word));
+}
+
+function containsAnyWord(value, words) {
+  const text = String(value || "").toLowerCase();
+  return words.some(word => text.includes(word));
+}
+
+function actionLooksHighRisk(action, el, root = document) {
+  const text = [
+    action?.type,
+    action?.selector,
+    action?.text,
+    el?.innerText,
+    el?.textContent,
+    el?.getAttribute?.("aria-label"),
+    el?.getAttribute?.("title"),
+    el?.getAttribute?.("name"),
+    el?.getAttribute?.("placeholder"),
+    getAssociatedLabel(el, root)
+  ].join(" ");
+
+  return containsAnyWord(text, PAYMENT_WORDS) || containsAnyWord(text, DESTRUCTIVE_WORDS);
+}
+
+function actionLooksLikeBlockedWrite(action, el, root = document) {
+  const text = [
+    action?.type,
+    action?.selector,
+    action?.text,
+    action?.description,
+    el?.innerText,
+    el?.textContent,
+    el?.getAttribute?.("aria-label"),
+    el?.getAttribute?.("title"),
+    el?.getAttribute?.("name"),
+    el?.getAttribute?.("placeholder"),
+    getAssociatedLabel(el, root)
+  ].join(" ");
+
+  return containsAnyWord(text, WRITE_ACTION_WORDS);
+}
+
+function shadowHostsInRoot(root) {
+  return queryAllInRoot(root, "*").filter(el => el.shadowRoot);
+}
+
+function walkRoots(callback, root = document, shadowPath = [], depth = 0) {
+  callback(root, shadowPath);
+
+  if (depth >= MAX_SHADOW_DEPTH) return;
+
+  for (const host of shadowHostsInRoot(root)) {
+    const hostSelector = buildSelectorInRoot(host, root);
+    if (!hostSelector) continue;
+
+    walkRoots(callback, host.shadowRoot, [...shadowPath, hostSelector], depth + 1);
+  }
+}
+
+function resolveActionRoot(action) {
+  let root = document;
+
+  for (const hostSelector of action.shadowPath || []) {
+    let host;
+
+    try {
+      host = root.querySelector(hostSelector);
+    } catch (error) {
+      return { error: `Invalid shadow host selector: ${hostSelector}` };
+    }
+
+    if (!host) return { error: `Shadow host not found: ${hostSelector}` };
+    if (!host.shadowRoot) return { error: `Shadow host is closed or inaccessible: ${hostSelector}` };
+    root = host.shadowRoot;
+  }
+
+  return { root };
+}
+
+function resolveActionElement(action) {
+  const resolved = resolveActionRoot(action);
+  if (resolved.error) return resolved;
+
+  if (!action.selector || typeof action.selector !== "string") {
+    return { error: "Action is missing a selector." };
+  }
+
+  try {
+    const el = resolved.root.querySelector(action.selector);
+    if (!el) return { error: `Element not found: ${action.selector}` };
+    return { el, root: resolved.root };
+  } catch (error) {
+    return { error: `Invalid selector: ${action.selector}` };
+  }
 }
 
 function collectInteractiveElements() {
   const elements = [];
   const seen = new Set();
 
-  for (const el of document.querySelectorAll(INTERACTIVE_SELECTOR)) {
-    if (elements.length >= MAX_ELEMENTS) break;
-    if (seen.has(el) || !isVisible(el)) continue;
+  walkRoots((root, shadowPath) => {
+    if (elements.length >= MAX_ELEMENTS) return;
 
-    seen.add(el);
+    for (const el of queryAllInRoot(root, INTERACTIVE_SELECTOR)) {
+      if (elements.length >= MAX_ELEMENTS) break;
+      if (seen.has(el) || !isVisible(el)) continue;
 
-    const selector = buildSelector(el);
-    if (!selector) continue;
+      seen.add(el);
 
-    const type = (el.getAttribute("type") || "").toLowerCase();
-    const summary = {
-      selector,
-      tag: el.tagName.toLowerCase(),
-      role: el.getAttribute("role") || "",
-      type,
-      text: getElementText(el),
-      label: getAssociatedLabel(el),
-      placeholder: cleanText(el.getAttribute("placeholder")),
-      name: cleanText(el.getAttribute("name")),
-      ariaLabel: cleanText(el.getAttribute("aria-label")),
-      disabled: Boolean(el.disabled || el.getAttribute("aria-disabled") === "true"),
-      sensitive: isSensitiveElement(el)
-    };
+      const selector = buildSelectorInRoot(el, root);
+      if (!selector) continue;
 
-    elements.push(summary);
-  }
+      const type = (el.getAttribute("type") || "").toLowerCase();
+
+      elements.push({
+        selector,
+        shadowPath,
+        tag: el.tagName.toLowerCase(),
+        role: el.getAttribute("role") || "",
+        type,
+        text: getElementText(el, root),
+        label: getAssociatedLabel(el, root),
+        placeholder: cleanText(el.getAttribute("placeholder")),
+        name: cleanText(el.getAttribute("name")),
+        ariaLabel: cleanText(el.getAttribute("aria-label")),
+        disabled: Boolean(el.disabled || el.getAttribute("aria-disabled") === "true"),
+        sensitive: isSensitiveElement(el, root)
+      });
+    }
+  });
 
   return elements;
 }
@@ -265,31 +353,126 @@ function collectInteractiveElements() {
 function collectFormValues() {
   const values = [];
 
-  for (const el of document.querySelectorAll("input, textarea, select, [contenteditable='true']")) {
-    if (values.length >= MAX_FORM_VALUES) break;
-    if (!isVisible(el) || isSensitiveElement(el)) continue;
+  walkRoots((root, shadowPath) => {
+    if (values.length >= MAX_FORM_VALUES) return;
 
-    const selector = buildSelector(el);
-    if (!selector) continue;
+    for (const el of queryAllInRoot(root, FORM_SELECTOR)) {
+      if (values.length >= MAX_FORM_VALUES) break;
+      if (!isVisible(el) || isSensitiveElement(el, root)) continue;
 
-    const value = el instanceof HTMLSelectElement
-      ? cleanText(el.selectedOptions?.[0]?.text || el.value, 500)
-      : el.isContentEditable
-        ? cleanText(el.innerText || el.textContent, 1000)
-        : cleanText(el.value, 1000);
+      const selector = buildSelectorInRoot(el, root);
+      if (!selector) continue;
 
-    values.push({
-      selector,
-      tag: el.tagName.toLowerCase(),
-      type: (el.getAttribute("type") || "").toLowerCase(),
-      label: getAssociatedLabel(el),
-      name: cleanText(el.getAttribute("name")),
-      placeholder: cleanText(el.getAttribute("placeholder")),
-      value
-    });
-  }
+      const value = el instanceof HTMLSelectElement
+        ? cleanText(el.selectedOptions?.[0]?.text || el.value, 500)
+        : el.isContentEditable
+          ? cleanText(el.innerText || el.textContent, 1000)
+          : cleanText(el.value, 1000);
+
+      values.push({
+        selector,
+        shadowPath,
+        tag: el.tagName.toLowerCase(),
+        type: (el.getAttribute("type") || "").toLowerCase(),
+        label: getAssociatedLabel(el, root),
+        name: cleanText(el.getAttribute("name")),
+        placeholder: cleanText(el.getAttribute("placeholder")),
+        value
+      });
+    }
+  });
 
   return values;
+}
+
+function nearestHeadingText(node) {
+  let el = node instanceof Element ? node : node.parentElement;
+
+  while (el && el !== document.body) {
+    const heading = el.matches?.("h1,h2,h3,h4,h5,h6,[role='heading']")
+      ? el
+      : el.querySelector?.("h1,h2,h3,h4,h5,h6,[role='heading']");
+
+    if (heading && isVisible(heading)) return cleanText(heading.innerText || heading.textContent, 120);
+    el = el.parentElement;
+  }
+
+  return cleanText(document.title || location.hostname, 120);
+}
+
+function appendTextChunk(chunks, state, text, meta) {
+  if (!text) return;
+
+  if (state.current && state.current.text.length + text.length + 1 > MAX_CHUNK_CHARS) {
+    chunks.push(state.current);
+    state.totalChars += state.current.text.length;
+    state.current = null;
+  }
+
+  if (!state.current) {
+    state.current = {
+      chunkId: `chunk-${chunks.length + 1}`,
+      heading: meta.heading || cleanText(document.title || location.hostname, 120),
+      source: meta.source,
+      shadowPath: meta.shadowPath || [],
+      visibility: "visible",
+      text: ""
+    };
+  }
+
+  state.current.text = `${state.current.text}${state.current.text ? "\n" : ""}${text}`.slice(0, MAX_CHUNK_CHARS);
+}
+
+function collectTextChunks() {
+  const chunks = [];
+  const state = {
+    current: null,
+    totalChars: 0
+  };
+
+  walkRoots((root, shadowPath) => {
+    if (chunks.length >= MAX_CHUNKS || state.totalChars >= MAX_TEXT_CHARS) return;
+
+    const walker = document.createTreeWalker(
+      root,
+      NodeFilter.SHOW_TEXT,
+      {
+        acceptNode(node) {
+          const text = node.textContent.trim();
+          if (!text) return NodeFilter.FILTER_REJECT;
+
+          const parent = node.parentElement;
+          if (!parent || !isVisible(parent)) return NodeFilter.FILTER_REJECT;
+
+          if (["SCRIPT", "STYLE", "NOSCRIPT"].includes(parent.tagName)) {
+            return NodeFilter.FILTER_REJECT;
+          }
+
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      }
+    );
+
+    while (walker.nextNode() && chunks.length < MAX_CHUNKS && state.totalChars < MAX_TEXT_CHARS) {
+      const node = walker.currentNode;
+      const text = cleanText(node.textContent, 900);
+      appendTextChunk(chunks, state, text, {
+        heading: nearestHeadingText(node),
+        source: shadowPath.length ? "open-shadow" : "dom",
+        shadowPath
+      });
+    }
+  });
+
+  if (state.current && chunks.length < MAX_CHUNKS) {
+    chunks.push(state.current);
+  }
+
+  return chunks.map((chunk, index) => ({ ...chunk, chunkId: `chunk-${index + 1}` }));
+}
+
+function getVisibleText() {
+  return collectTextChunks().map(chunk => chunk.text).join("\n").slice(0, MAX_TEXT_CHARS);
 }
 
 function getScrollState() {
@@ -313,56 +496,32 @@ function getScrollState() {
   };
 }
 
-function getCollectionSnapshot() {
+function collectShadowWarnings() {
+  const warnings = [];
+  const customElements = queryAllInRoot(document, "*").filter(el => el.localName.includes("-"));
+  const closedOrUnknown = customElements.filter(el => !el.shadowRoot).slice(0, 12);
+
+  if (closedOrUnknown.length) {
+    warnings.push("Some custom elements may use closed or inaccessible shadow roots.");
+  }
+
+  return warnings;
+}
+
+function getFrameContext() {
+  const chunks = collectTextChunks();
+
   return {
     url: location.href,
     title: document.title,
     timestamp: new Date().toISOString(),
-    text: getVisibleText(),
+    text: chunks.map(chunk => chunk.text).join("\n").slice(0, MAX_TEXT_CHARS),
+    chunks,
     elements: collectInteractiveElements(),
     formValues: collectFormValues(),
-    scroll: getScrollState()
+    scroll: getScrollState(),
+    warnings: collectShadowWarnings()
   };
-}
-
-function containsAnyWord(value, words) {
-  const text = String(value || "").toLowerCase();
-  return words.some(word => text.includes(word));
-}
-
-function actionLooksHighRisk(action, el) {
-  const text = [
-    action?.type,
-    action?.selector,
-    action?.text,
-    el?.innerText,
-    el?.textContent,
-    el?.getAttribute?.("aria-label"),
-    el?.getAttribute?.("title"),
-    el?.getAttribute?.("name"),
-    el?.getAttribute?.("placeholder"),
-    getAssociatedLabel(el)
-  ].join(" ");
-
-  return containsAnyWord(text, PAYMENT_WORDS) || containsAnyWord(text, DESTRUCTIVE_WORDS);
-}
-
-function actionLooksLikeBlockedWrite(action, el) {
-  const text = [
-    action?.type,
-    action?.selector,
-    action?.text,
-    action?.description,
-    el?.innerText,
-    el?.textContent,
-    el?.getAttribute?.("aria-label"),
-    el?.getAttribute?.("title"),
-    el?.getAttribute?.("name"),
-    el?.getAttribute?.("placeholder"),
-    getAssociatedLabel(el)
-  ].join(" ");
-
-  return containsAnyWord(text, WRITE_ACTION_WORDS);
 }
 
 function setElementValue(el, value) {
@@ -411,12 +570,12 @@ function isSubmitControl(el) {
   return false;
 }
 
-function runType(el, text) {
+function runType(el, root, text) {
   if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el.isContentEditable)) {
     return { error: "Target is not a text input, textarea, or contenteditable element." };
   }
 
-  if (isSensitiveElement(el)) {
+  if (isSensitiveElement(el, root)) {
     return { error: "Blocked typing into a password, OTP, card, or secret field." };
   }
 
@@ -430,8 +589,8 @@ function runType(el, text) {
   return { ok: true, result: "typed" };
 }
 
-function runSubmit(el) {
-  if (actionLooksHighRisk({ type: "submit" }, el)) {
+function runSubmit(el, root) {
+  if (actionLooksHighRisk({ type: "submit" }, el, root)) {
     return { error: "Blocked high-risk submit action." };
   }
 
@@ -461,8 +620,8 @@ function runSubmit(el) {
   return { error: "No form or submit-like element found for submit action." };
 }
 
-function runExtract(el) {
-  if (isSensitiveElement(el)) {
+function runExtract(el, root) {
+  if (isSensitiveElement(el, root)) {
     return { error: "Blocked extracting from a sensitive field." };
   }
 
@@ -478,40 +637,29 @@ async function runAction(action) {
     return { error: "Invalid action." };
   }
 
-  const { type, selector, text } = action;
+  const type = String(action.type || "");
 
   if (!["click", "type", "submit", "extract"].includes(type)) {
     return { error: `Unsupported action type: ${type}` };
   }
 
-  if (!selector || typeof selector !== "string") {
-    return { error: "Action is missing a selector." };
-  }
+  const resolved = resolveActionElement(action);
+  if (resolved.error) return { error: resolved.error };
 
-  let el;
-
-  try {
-    el = document.querySelector(selector);
-  } catch (error) {
-    return { error: `Invalid selector: ${selector}` };
-  }
-
-  if (!el) {
-    return { error: `Element not found: ${selector}` };
-  }
+  const { el, root } = resolved;
 
   if (!isVisible(el)) {
     return { error: "Target element is not visible." };
   }
 
-  if (actionLooksHighRisk(action, el)) {
+  if (actionLooksHighRisk(action, el, root)) {
     return { error: "Blocked high-risk payment, purchase, transfer, or destructive action." };
   }
 
   if (type === "click") return runClick(el);
-  if (type === "type") return runType(el, text || "");
-  if (type === "submit") return runSubmit(el);
-  if (type === "extract") return runExtract(el);
+  if (type === "type") return runType(el, root, action.text || "");
+  if (type === "submit") return runSubmit(el, root);
+  if (type === "extract") return runExtract(el, root);
 
   return { error: "Action did not run." };
 }
@@ -602,46 +750,33 @@ async function runCollectionAction(action) {
   }
 
   if (type === "extract") {
-    return { ok: true, result: "snapshot extracted", snapshot: getCollectionSnapshot() };
+    return { ok: true, result: "snapshot extracted", snapshot: getFrameContext() };
   }
 
   if (type === "injectScriptOnce") return runInjectScriptOnce(action);
   if (type === "navigateCurrentUrl") return runNavigateCurrentUrl(action);
 
   if (type === "click" || type === "type") {
-    if (!action.selector || typeof action.selector !== "string") {
-      return { error: "Action is missing a selector." };
-    }
+    const resolved = resolveActionElement(action);
+    if (resolved.error) return { error: resolved.error };
 
-    let el;
+    const { el, root } = resolved;
 
-    try {
-      el = document.querySelector(action.selector);
-    } catch (error) {
-      return { error: `Invalid selector: ${action.selector}` };
-    }
-
-    if (!el) return { error: `Element not found: ${action.selector}` };
     if (!isVisible(el)) return { error: "Target element is not visible." };
-    if (actionLooksHighRisk(action, el) || actionLooksLikeBlockedWrite(action, el)) {
+    if (actionLooksHighRisk(action, el, root) || actionLooksLikeBlockedWrite(action, el, root)) {
       return { error: "Blocked high-risk or write-like page action." };
     }
 
     if (type === "click") return runClick(el);
-    return runType(el, action.text || "");
+    return runType(el, root, action.text || "");
   }
 
   return { error: `Unsupported collection action type: ${type}` };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message?.type === "GET_PAGE_CONTEXT") {
-    sendResponse({
-      url: location.href,
-      title: document.title,
-      text: getVisibleText(),
-      elements: collectInteractiveElements()
-    });
+  if (message?.type === "GET_FRAME_CONTEXT" || message?.type === "GET_PAGE_CONTEXT") {
+    sendResponse(getFrameContext());
     return false;
   }
 
@@ -653,7 +788,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "GET_COLLECTION_SNAPSHOT") {
-    sendResponse(getCollectionSnapshot());
+    sendResponse(getFrameContext());
     return false;
   }
 
