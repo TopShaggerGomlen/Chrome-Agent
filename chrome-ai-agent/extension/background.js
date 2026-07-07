@@ -349,6 +349,11 @@ async function runActionInFrame(message) {
   const tab = await getActiveTab();
   const action = message.action || {};
   const frameId = Number.isFinite(action.frameId) ? action.frameId : 0;
+  const messageType = message.preview
+    ? "PREVIEW_ACTION"
+    : message.collection
+      ? "RUN_COLLECTION_ACTION"
+      : "RUN_ACTION";
 
   if (!tab?.id) {
     return { error: "No active tab found." };
@@ -358,7 +363,7 @@ async function runActionInFrame(message) {
     return await tabsSendMessage(
       tab.id,
       {
-        type: message.collection ? "RUN_COLLECTION_ACTION" : "RUN_ACTION",
+        type: messageType,
         action
       },
       { frameId }
@@ -383,6 +388,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     runActionInFrame({ action: message.action, collection: Boolean(message.collection) })
       .then(sendResponse)
       .catch(error => sendResponse({ error: error.message || "Could not run page action." }));
+    return true;
+  }
+
+  if (message?.type === "PREVIEW_PAGE_ACTION") {
+    runActionInFrame({ action: message.action, preview: true })
+      .then(sendResponse)
+      .catch(error => sendResponse({ error: error.message || "Could not preview page action." }));
     return true;
   }
 

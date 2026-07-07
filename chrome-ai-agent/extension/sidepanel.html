@@ -140,11 +140,22 @@
         <div id="response" class="box message-panel response-log">Ready. Ask me to summarize, extract, compare, or take action on this page.</div>
         <div id="actions" class="box actions-panel" style="display:none;"></div>
         <button id="runBatchBtn" class="primary-button run-batch-button" type="button" style="display:none;">Run Batch</button>
+
+        <section class="action-history-section" aria-label="Action history">
+          <div class="history-title-row">
+            <h3>Action History</h3>
+            <button id="clearHistoryBtn" class="ghost-button compact-button" type="button">Clear History</button>
+          </div>
+          <ol id="actionHistory" class="action-history-list">
+            <li class="history-empty">No actions yet.</li>
+          </ol>
+        </section>
       </main>
 
       <section class="composer-card" aria-label="Prompt composer">
         <div id="attachmentTray" class="attachment-tray"></div>
         <textarea id="task" placeholder="Ask about this page or describe an action..."></textarea>
+        <div id="composerState" class="composer-state" aria-live="polite">No files · Screenshot off</div>
         <div class="composer-actions">
           <div class="composer-left">
             <button id="attachFileBtn" class="icon-button" type="button" title="Attach files" aria-label="Attach files">

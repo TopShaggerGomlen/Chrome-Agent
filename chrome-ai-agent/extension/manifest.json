@@ -9,6 +9,7 @@
     "debugger",
     "scripting",
     "sidePanel",
+    "storage",
     "tabs",
     "webNavigation"
   ],

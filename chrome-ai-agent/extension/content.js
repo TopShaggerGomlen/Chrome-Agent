@@ -556,6 +556,46 @@ function runClick(el) {
   return { ok: true, result: "clicked" };
 }
 
+function removePreviewOverlay() {
+  document.getElementById("chrome-ai-agent-preview-overlay")?.remove();
+}
+
+function previewElement(el) {
+  if (!isVisible(el)) {
+    return { error: "Target element is not visible." };
+  }
+
+  el.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
+  el.focus?.({ preventScroll: true });
+
+  const rect = el.getBoundingClientRect();
+  removePreviewOverlay();
+
+  const overlay = document.createElement("div");
+  overlay.id = "chrome-ai-agent-preview-overlay";
+  overlay.setAttribute("aria-hidden", "true");
+  overlay.style.position = "fixed";
+  overlay.style.left = `${Math.max(rect.left - 6, 0)}px`;
+  overlay.style.top = `${Math.max(rect.top - 6, 0)}px`;
+  overlay.style.width = `${Math.max(rect.width + 12, 16)}px`;
+  overlay.style.height = `${Math.max(rect.height + 12, 16)}px`;
+  overlay.style.border = "3px solid #39b8ff";
+  overlay.style.borderRadius = "10px";
+  overlay.style.boxShadow = "0 0 0 4px rgba(57, 184, 255, 0.24), 0 12px 34px rgba(0, 0, 0, 0.28)";
+  overlay.style.pointerEvents = "none";
+  overlay.style.zIndex = "2147483647";
+  overlay.style.transition = "opacity 180ms ease";
+
+  document.documentElement.appendChild(overlay);
+
+  setTimeout(() => {
+    overlay.style.opacity = "0";
+    setTimeout(removePreviewOverlay, 220);
+  }, 700);
+
+  return { ok: true, result: "previewed target" };
+}
+
 function isSubmitControl(el) {
   if (el instanceof HTMLButtonElement) {
     const type = (el.getAttribute("type") || "submit").toLowerCase();
@@ -662,6 +702,29 @@ async function runAction(action) {
   if (type === "extract") return runExtract(el, root);
 
   return { error: "Action did not run." };
+}
+
+async function previewAction(action) {
+  if (!action || typeof action !== "object") {
+    return { error: "Invalid action." };
+  }
+
+  const type = String(action.type || "");
+
+  if (!["click", "type", "submit"].includes(type)) {
+    return { ok: true, result: "preview skipped" };
+  }
+
+  const resolved = resolveActionElement(action);
+  if (resolved.error) return { error: resolved.error };
+
+  const { el, root } = resolved;
+
+  if (actionLooksHighRisk(action, el, root)) {
+    return { error: "Blocked high-risk payment, purchase, transfer, or destructive action." };
+  }
+
+  return previewElement(el);
 }
 
 function sleep(ms) {
@@ -784,6 +847,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     runAction(message.action)
       .then(sendResponse)
       .catch(error => sendResponse({ error: error.message || "Action failed." }));
+    return true;
+  }
+
+  if (message?.type === "PREVIEW_ACTION") {
+    previewAction(message.action)
+      .then(sendResponse)
+      .catch(error => sendResponse({ error: error.message || "Action preview failed." }));
     return true;
   }
 

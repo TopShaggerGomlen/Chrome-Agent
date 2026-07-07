@@ -88,6 +88,115 @@ const WRITE_ACTION_WORDS = [
   "confirm",
   "approve"
 ];
+const JSON_STRING = { type: "string" };
+const JSON_NUMBER = { type: "number" };
+const JSON_STRING_ARRAY = {
+  type: "array",
+  items: JSON_STRING
+};
+const AGENT_ACTION_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["type", "selector", "text", "frameId", "shadowPath"],
+  properties: {
+    type: { type: "string", enum: ["click", "type", "submit", "extract"] },
+    selector: JSON_STRING,
+    text: JSON_STRING,
+    frameId: JSON_NUMBER,
+    shadowPath: JSON_STRING_ARRAY
+  }
+};
+const COLLECTION_ACTION_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "type",
+    "selector",
+    "text",
+    "direction",
+    "pixels",
+    "ms",
+    "name",
+    "url",
+    "description",
+    "frameId",
+    "shadowPath"
+  ],
+  properties: {
+    type: { type: "string", enum: Array.from(COLLECTION_ACTION_TYPES) },
+    selector: JSON_STRING,
+    text: JSON_STRING,
+    direction: { type: "string", enum: ["down", "up", "top", "bottom", ""] },
+    pixels: JSON_NUMBER,
+    ms: JSON_NUMBER,
+    name: JSON_STRING,
+    url: JSON_STRING,
+    description: JSON_STRING,
+    frameId: JSON_NUMBER,
+    shadowPath: JSON_STRING_ARRAY
+  }
+};
+const AGENT_RESPONSE_FORMAT = {
+  type: "json_schema",
+  name: "agent_action_plan",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["reply", "actions"],
+    properties: {
+      reply: JSON_STRING,
+      actions: {
+        type: "array",
+        items: AGENT_ACTION_SCHEMA
+      }
+    }
+  }
+};
+const COLLECTION_RESPONSE_FORMAT = {
+  type: "json_schema",
+  name: "collection_step_plan",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["reply", "done", "actions", "rows", "fields", "warnings", "nextRecordHint", "stopReason"],
+    properties: {
+      reply: JSON_STRING,
+      done: { type: "boolean" },
+      actions: {
+        type: "array",
+        items: COLLECTION_ACTION_SCHEMA
+      },
+      rows: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["cells"],
+          properties: {
+            cells: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["field", "value"],
+                properties: {
+                  field: JSON_STRING,
+                  value: JSON_STRING
+                }
+              }
+            }
+          }
+        }
+      },
+      fields: JSON_STRING_ARRAY,
+      warnings: JSON_STRING_ARRAY,
+      nextRecordHint: JSON_STRING,
+      stopReason: JSON_STRING
+    }
+  }
+};
 
 const app = express();
 let codexLoginProcess = null;
@@ -739,6 +848,28 @@ function normalizeCollectionRows(rows, page) {
   });
 }
 
+function collectionRowsFromModel(rows) {
+  if (!Array.isArray(rows)) return [];
+
+  return rows.map(row => {
+    if (Array.isArray(row?.cells)) {
+      const output = {};
+
+      for (const cell of row.cells) {
+        const field = safeText(cell?.field, 120);
+        if (!field) continue;
+        output[field] = cell?.value === null || cell?.value === undefined
+          ? ""
+          : safeText(cell.value, 1000);
+      }
+
+      return output;
+    }
+
+    return row;
+  });
+}
+
 function validateCollectionActions(actions, page) {
   const validActions = [];
   const blockedActions = [];
@@ -864,6 +995,7 @@ function buildCollectionPrompt({ task, fields, playbook, limits, runState, page,
     "If the playbook requests dialog auto-dismissal, use {\"type\":\"injectScriptOnce\",\"name\":\"autoDismissDialogs\"}.",
     "If page content appears stale after navigation, use {\"type\":\"navigateCurrentUrl\"} to force a same-URL repaint.",
     "Extract rows only when evidence is visible in page text/form values or supplied attached context. Add notes/unresolvedFields for missing values.",
+    "When a structured schema is provided, return each row as {\"cells\":[{\"field\":\"field name\",\"value\":\"field value\"}]}.",
     "Set done=true only when the collection task is complete or cannot progress safely."
   ].join("\n");
 
@@ -1086,18 +1218,23 @@ function claudeContent(input, screenshot) {
   return parts;
 }
 
-async function callOpenAI({ instructions, input, settings, screenshot }) {
+async function callOpenAI({ instructions, input, settings, screenshot, responseFormat }) {
   if (!settings.openaiApiKey) {
     throw new Error("Missing OpenAI API key. Save it in Provider settings or set OPENAI_API_KEY in server/.env.");
   }
 
   const client = new OpenAI({ apiKey: settings.openaiApiKey });
-
-  const response = await client.responses.create({
+  const request = {
     model: settings.openaiModel,
     instructions,
     input: openAIInput(input, screenshot)
-  });
+  };
+
+  if (responseFormat) {
+    request.text = { format: responseFormat };
+  }
+
+  const response = await client.responses.create(request);
 
   return response.output_text || "";
 }
@@ -1203,6 +1340,44 @@ async function callSelectedProvider({ provider, instructions, input, settings, s
   }
 
   throw new Error(`Unsupported provider: ${provider}`);
+}
+
+function isStructuredOutputError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+
+  return [
+    "json_schema",
+    "structured",
+    "response_format",
+    "text.format",
+    "schema",
+    "unsupported",
+    "unknown parameter",
+    "invalid parameter"
+  ].some(fragment => message.includes(fragment));
+}
+
+async function callSelectedProviderJson({ provider, instructions, input, settings, screenshot, signal, responseFormat }) {
+  if (provider === "openai_api_key" && responseFormat) {
+    try {
+      return {
+        raw: await callOpenAI({ instructions, input, settings, screenshot, responseFormat }),
+        warnings: []
+      };
+    } catch (error) {
+      if (!isStructuredOutputError(error)) throw error;
+
+      return {
+        raw: await callOpenAI({ instructions, input, settings, screenshot }),
+        warnings: [`OpenAI structured output unavailable; used plain JSON fallback. ${safeText(error.message, 220)}`]
+      };
+    }
+  }
+
+  return {
+    raw: await callSelectedProvider({ provider, instructions, input, settings, screenshot, signal }),
+    warnings: []
+  };
 }
 
 function buildReplyPrompt({ task, page, attachedFiles }) {
@@ -1451,14 +1626,17 @@ async function buildAgentFinalResponse({ body, signal }) {
     allowSubmit
   });
 
-  const raw = await callSelectedProvider({
+  const providerResult = await callSelectedProviderJson({
     provider: settings.provider,
     instructions,
     input,
     settings,
     screenshot: modelScreenshot,
-    signal
+    signal,
+    responseFormat: AGENT_RESPONSE_FORMAT
   });
+  const raw = providerResult.raw;
+  warnings.push(...providerResult.warnings);
 
   const parsed = extractJson(raw);
 
@@ -1770,13 +1948,15 @@ app.post("/collection/step", async (req, res) => {
       attachedFiles
     });
 
-    const raw = await callSelectedProvider({
+    const providerResult = await callSelectedProviderJson({
       provider: settings.provider,
       instructions,
       input,
       settings,
-      screenshot: modelScreenshot
+      screenshot: modelScreenshot,
+      responseFormat: COLLECTION_RESPONSE_FORMAT
     });
+    const raw = providerResult.raw;
     const parsed = extractJson(raw);
 
     if (!parsed) {
@@ -1786,7 +1966,7 @@ app.post("/collection/step", async (req, res) => {
         actions: [],
         rows: [],
         fields: requestedFields,
-        warnings: [...requestWarnings, "Model did not return valid collection JSON."],
+        warnings: [...requestWarnings, ...providerResult.warnings, "Model did not return valid collection JSON."],
         blockedActions: [],
         nextRecordHint: "",
         stopReason: "",
@@ -1795,12 +1975,12 @@ app.post("/collection/step", async (req, res) => {
     }
 
     const { validActions, blockedActions } = validateCollectionActions(parsed.actions, page);
-    const rows = normalizeCollectionRows(parsed.rows, page);
+    const rows = normalizeCollectionRows(collectionRowsFromModel(parsed.rows), page);
     const responseFields = normalizeCollectionFields(parsed.fields);
     const warnings = Array.isArray(parsed.warnings)
       ? parsed.warnings.map(warning => safeText(warning, 500)).filter(Boolean)
       : [];
-    warnings.unshift(...requestWarnings);
+    warnings.unshift(...requestWarnings, ...providerResult.warnings);
 
     if (blockedActions.length) {
       warnings.push(`${blockedActions.length} proposed action(s) were blocked by validation.`);

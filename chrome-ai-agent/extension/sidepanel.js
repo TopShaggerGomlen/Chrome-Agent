@@ -15,6 +15,8 @@ const settingsToggleBtn = document.getElementById("settingsToggleBtn");
 const apiKeyToggleBtn = document.getElementById("apiKeyToggleBtn");
 const agentStateTitle = document.getElementById("agentStateTitle");
 const activityTimeline = document.getElementById("activityTimeline");
+const actionHistoryList = document.getElementById("actionHistory");
+const clearHistoryBtn = document.getElementById("clearHistoryBtn");
 
 const taskInput = document.getElementById("task");
 const askBtn = document.getElementById("askBtn");
@@ -25,7 +27,9 @@ const clearBtn = document.getElementById("clearBtn");
 const attachFileBtn = document.getElementById("attachFileBtn");
 const fileInput = document.getElementById("fileInput");
 const includeScreenshotInput = document.getElementById("includeScreenshot");
+const screenshotToggle = includeScreenshotInput?.closest(".icon-toggle");
 const attachmentTray = document.getElementById("attachmentTray");
+const composerState = document.getElementById("composerState");
 const responseBox = document.getElementById("response");
 const actionsBox = document.getElementById("actions");
 const collectionTaskInput = document.getElementById("collectionTask");
@@ -60,6 +64,9 @@ const MAX_ATTACHMENT_BYTES = 512 * 1024;
 const MAX_ATTACHMENT_CHARS = 12000;
 const MAX_TOTAL_ATTACHMENT_CHARS = 30000;
 const ACTIVITY_LIMIT = 8;
+const ACTION_HISTORY_LIMIT = 60;
+const ACTION_HISTORY_STORAGE_KEY = "chromeAiAgentActionHistory";
+const TASK_DRAFT_STORAGE_KEY = "chromeAiAgentTaskDraft";
 
 let pendingActions = [];
 let executedActions = [];
@@ -72,6 +79,9 @@ let collectionPlaybookName = "";
 let collectionRun = createEmptyCollectionRun();
 let activeAbortController = null;
 let batchRunning = false;
+let actionHistory = [];
+let runningActionHistoryId = "";
+let lastTaskDraftSaveTimer = null;
 
 function setBusy(isBusy) {
   document.body.classList.toggle("is-busy", isBusy);
@@ -89,14 +99,234 @@ function setBusy(isBusy) {
   stopBtn.disabled = !isBusy && !collectionRun.running && !batchRunning;
 }
 
+function storageLocal() {
+  return chrome?.storage?.local || null;
+}
+
+function storageGet(key) {
+  const storage = storageLocal();
+  if (!storage) return Promise.resolve({});
+
+  return new Promise(resolve => {
+    storage.get(key, value => resolve(value || {}));
+  });
+}
+
+function storageSet(value) {
+  const storage = storageLocal();
+  if (!storage) return Promise.resolve();
+
+  return new Promise(resolve => {
+    storage.set(value, () => resolve());
+  });
+}
+
+function storageRemove(key) {
+  const storage = storageLocal();
+  if (!storage) return Promise.resolve();
+
+  return new Promise(resolve => {
+    storage.remove(key, () => resolve());
+  });
+}
+
+function compactText(value, max = 120) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
+function normalizeComparableText(value) {
+  return compactText(value, 300).toLowerCase();
+}
+
+function actionId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `action-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function currentPageReference() {
+  const page = latestPageData?.pageData || {};
+  const tab = latestPageData?.tab || {};
+
+  return {
+    url: tab.url || page.url || "",
+    title: tab.title || page.title || ""
+  };
+}
+
+function actionSummary(action) {
+  const type = String(action?.type || "action").toLowerCase();
+  const target = compactText(
+    action?.description ||
+    action?.label ||
+    action?.ariaLabel ||
+    action?.placeholder ||
+    action?.name ||
+    action?.elementText ||
+    action?.selector,
+    80
+  );
+
+  if (type === "type") {
+    return `Type "${compactText(action?.text, 40)}"${target ? ` into ${target}` : ""}`;
+  }
+
+  if (type === "submit") return `Submit${target ? ` ${target}` : ""}`;
+  if (type === "click") return `Click${target ? ` ${target}` : ""}`;
+  if (type === "extract") return `Extract${target ? ` from ${target}` : ""}`;
+  return `${type}${target ? ` ${target}` : ""}`;
+}
+
+function actionMeta(action) {
+  const parts = [];
+  const selector = compactText(action?.selector, 140);
+  const frameId = Number.isFinite(action?.frameId) ? action.frameId : 0;
+
+  if (selector) parts.push(`Selector: ${selector}`);
+  parts.push(`Frame: ${frameId}`);
+
+  if (Array.isArray(action?.shadowPath) && action.shadowPath.length) {
+    parts.push(`Shadow path: ${action.shadowPath.join(" > ")}`);
+  }
+
+  return parts;
+}
+
+function renderActionHistory() {
+  if (!actionHistoryList) return;
+
+  actionHistoryList.textContent = "";
+
+  if (!actionHistory.length) {
+    const empty = document.createElement("li");
+    empty.className = "history-empty";
+    empty.textContent = "No actions yet.";
+    actionHistoryList.appendChild(empty);
+    return;
+  }
+
+  for (const item of actionHistory.slice().reverse()) {
+    const entry = document.createElement("li");
+    entry.className = `history-entry history-${item.status || "proposed"}`;
+
+    const main = document.createElement("div");
+    main.className = "history-main";
+
+    const time = document.createElement("span");
+    time.className = "history-time";
+    time.textContent = item.timestamp
+      ? new Date(item.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : "";
+
+    const summary = document.createElement("span");
+    summary.className = "history-summary";
+    summary.textContent = item.summary || "Action";
+    summary.title = item.summary || "";
+
+    const status = document.createElement("span");
+    status.className = `history-status ${item.status || "proposed"}`;
+    status.textContent = item.status || "proposed";
+
+    main.appendChild(time);
+    main.appendChild(summary);
+    main.appendChild(status);
+    entry.appendChild(main);
+
+    const meta = document.createElement("div");
+    meta.className = "history-meta";
+
+    for (const line of [
+      item.result ? `Result: ${compactText(item.result, 160)}` : "",
+      item.error ? `Error: ${compactText(item.error, 180)}` : "",
+      item.rematchNote ? compactText(item.rematchNote, 180) : "",
+      item.riskReasons?.length ? `Risk: ${item.riskReasons.join(" ")}` : "",
+      ...(Array.isArray(item.meta) ? item.meta : [])
+    ].filter(Boolean).slice(0, 5)) {
+      const span = document.createElement("span");
+      span.textContent = line;
+      span.title = line;
+      meta.appendChild(span);
+    }
+
+    if (meta.children.length) entry.appendChild(meta);
+    actionHistoryList.appendChild(entry);
+  }
+}
+
+async function persistActionHistory() {
+  actionHistory = actionHistory.slice(-ACTION_HISTORY_LIMIT);
+  await storageSet({ [ACTION_HISTORY_STORAGE_KEY]: actionHistory });
+}
+
+async function loadActionHistory() {
+  const data = await storageGet(ACTION_HISTORY_STORAGE_KEY);
+  const stored = data[ACTION_HISTORY_STORAGE_KEY];
+  actionHistory = Array.isArray(stored) ? stored.slice(-ACTION_HISTORY_LIMIT) : [];
+  renderActionHistory();
+}
+
+function addActionHistoryEntry(action, status, patch = {}) {
+  const { url, title } = currentPageReference();
+  const entry = {
+    id: actionId(),
+    status,
+    timestamp: new Date().toISOString(),
+    task: compactText(patch.task || taskInput.value, 400),
+    url,
+    title,
+    summary: actionSummary(action),
+    action: {
+      type: action?.type || "",
+      selector: action?.selector || "",
+      text: action?.text || "",
+      frameId: Number.isFinite(action?.frameId) ? action.frameId : 0,
+      shadowPath: Array.isArray(action?.shadowPath) ? action.shadowPath : []
+    },
+    riskLabel: action?.riskLabel || "",
+    riskReasons: Array.isArray(action?.riskReasons) ? action.riskReasons : [],
+    meta: actionMeta(action),
+    attempts: 0,
+    result: "",
+    error: "",
+    rematchNote: "",
+    ...patch
+  };
+
+  actionHistory.push(entry);
+  renderActionHistory();
+  persistActionHistory();
+  return entry.id;
+}
+
+function updateActionHistoryEntry(id, patch) {
+  if (!id) return;
+
+  const index = actionHistory.findIndex(item => item.id === id);
+  if (index === -1) return;
+
+  actionHistory[index] = {
+    ...actionHistory[index],
+    ...patch,
+    timestamp: patch.timestamp || actionHistory[index].timestamp
+  };
+  renderActionHistory();
+  persistActionHistory();
+}
+
+function clearActionHistory() {
+  actionHistory = [];
+  renderActionHistory();
+  storageSet({ [ACTION_HISTORY_STORAGE_KEY]: actionHistory });
+}
+
 function appendResponse(text) {
   responseBox.textContent += `\n\n${text}`;
   updateAgentStateFromMessage(text);
 
   const clean = String(text || "").trim();
-  if (clean.startsWith("Action result:")) {
-    recordActivity("Action result received", clean.includes("\"error\"") ? "danger" : "success");
-  } else if (clean) {
+  if (clean) {
     recordActivity(clean);
   }
 }
@@ -263,6 +493,57 @@ function renderAttachments() {
     chip.appendChild(removeBtn);
     attachmentTray.appendChild(chip);
   }
+
+  updateComposerState();
+}
+
+function updateComposerState() {
+  const fileText = attachedFiles.length === 1
+    ? "1 file attached"
+    : attachedFiles.length
+      ? `${attachedFiles.length} files attached`
+      : "No files";
+  const screenshotOn = Boolean(includeScreenshotInput?.checked);
+  const screenshotText = screenshotOn ? "Screenshot on" : "Screenshot off";
+
+  if (composerState) {
+    composerState.textContent = `${fileText} · ${screenshotText}`;
+  }
+
+  if (screenshotToggle) {
+    screenshotToggle.classList.toggle("is-active", screenshotOn);
+    screenshotToggle.title = screenshotOn ? "Screenshot context is on" : "Screenshot context is off";
+    screenshotToggle.setAttribute("aria-label", screenshotToggle.title);
+  }
+}
+
+function resizeTaskInput() {
+  if (!taskInput) return;
+
+  taskInput.style.height = "auto";
+  const nextHeight = Math.min(Math.max(taskInput.scrollHeight, 88), 180);
+  taskInput.style.height = `${nextHeight}px`;
+  taskInput.style.overflowY = taskInput.scrollHeight > 180 ? "auto" : "hidden";
+}
+
+function saveTaskDraftSoon() {
+  if (lastTaskDraftSaveTimer) {
+    clearTimeout(lastTaskDraftSaveTimer);
+  }
+
+  lastTaskDraftSaveTimer = setTimeout(() => {
+    storageSet({ [TASK_DRAFT_STORAGE_KEY]: taskInput.value });
+  }, 160);
+}
+
+async function loadTaskDraft() {
+  const data = await storageGet(TASK_DRAFT_STORAGE_KEY);
+  const draft = data[TASK_DRAFT_STORAGE_KEY];
+
+  if (typeof draft === "string" && !taskInput.value) {
+    taskInput.value = draft;
+    resizeTaskInput();
+  }
 }
 
 async function readAttachment(file) {
@@ -363,6 +644,132 @@ function executableActions(actions) {
   return (actions || [])
     .map(normalizeActionForDisplay)
     .filter(action => action.riskLabel !== "blocked");
+}
+
+function normalizeShadowPath(value) {
+  return Array.isArray(value)
+    ? value.map(item => String(item || "").trim()).filter(Boolean)
+    : [];
+}
+
+function targetKey(action) {
+  return JSON.stringify({
+    frameId: Number.isFinite(action?.frameId) ? action.frameId : 0,
+    selector: String(action?.selector || ""),
+    shadowPath: normalizeShadowPath(action?.shadowPath)
+  });
+}
+
+function pageElements(pageData = latestPageData?.pageData) {
+  return Array.isArray(pageData?.elements) ? pageData.elements : [];
+}
+
+function elementForAction(action, pageData = latestPageData?.pageData) {
+  const key = targetKey(action);
+  return pageElements(pageData).find(element => targetKey(element) === key) || null;
+}
+
+function enrichActionForDisplay(action, pageData = latestPageData?.pageData) {
+  const element = elementForAction(action, pageData);
+  if (!element) return action;
+
+  return {
+    ...action,
+    tag: element.tag || action.tag,
+    role: element.role || action.role,
+    elementType: element.type || action.elementType,
+    label: element.label || action.label,
+    placeholder: element.placeholder || action.placeholder,
+    name: element.name || action.name,
+    ariaLabel: element.ariaLabel || action.ariaLabel,
+    elementText: element.text || action.elementText
+  };
+}
+
+function retryableSelectorError(error) {
+  const text = String(error || "").toLowerCase();
+  if (!text) return false;
+  if (text.includes("blocked") || text.includes("password") || text.includes("otp") || text.includes("card") || text.includes("secret")) return false;
+  if (text.includes("high-risk") || text.includes("disabled") || text.includes("read-only")) return false;
+
+  return [
+    "element not found",
+    "invalid selector",
+    "missing selector",
+    "shadow host not found",
+    "closed or inaccessible",
+    "target element is not visible",
+    "could not run action in frame"
+  ].some(fragment => text.includes(fragment));
+}
+
+function comparableFields(element) {
+  return ["label", "text", "ariaLabel", "placeholder", "name"]
+    .map(key => normalizeComparableText(element?.[key]))
+    .filter(Boolean);
+}
+
+function elementMatchScore(original, candidate, action) {
+  if (!original || !candidate?.selector || candidate.disabled) return 0;
+  if ((action.type === "type" || action.type === "extract") && candidate.sensitive) return 0;
+
+  let score = 0;
+  const sameFrame = Number(original.frameId || 0) === Number(candidate.frameId || 0);
+  const originalShadow = JSON.stringify(normalizeShadowPath(original.shadowPath));
+  const candidateShadow = JSON.stringify(normalizeShadowPath(candidate.shadowPath));
+
+  if (sameFrame) score += 2;
+  if (originalShadow === candidateShadow) score += 2;
+  if (original.tag && original.tag === candidate.tag) score += 2;
+  if (original.role && original.role === candidate.role) score += 2;
+  if (original.type && original.type === candidate.type) score += 1;
+
+  const originalFields = comparableFields(original);
+  const candidateFields = comparableFields(candidate);
+
+  for (const originalText of originalFields) {
+    for (const candidateText of candidateFields) {
+      if (originalText === candidateText) {
+        score += 4;
+      } else if (
+        originalText.length >= 4 &&
+        candidateText.length >= 4 &&
+        (originalText.includes(candidateText) || candidateText.includes(originalText))
+      ) {
+        score += 2;
+      }
+    }
+  }
+
+  return score;
+}
+
+function rematchAction(action, oldPageData, newPageData) {
+  const original = elementForAction(action, oldPageData);
+  if (!original) return null;
+
+  const scored = pageElements(newPageData)
+    .map(candidate => ({
+      candidate,
+      score: elementMatchScore(original, candidate, action)
+    }))
+    .filter(item => item.score >= 8)
+    .sort((a, b) => b.score - a.score);
+
+  if (!scored.length) return null;
+  if (scored[1] && scored[0].score - scored[1].score < 3) return null;
+
+  const candidate = scored[0].candidate;
+  return {
+    action: {
+      ...action,
+      selector: candidate.selector,
+      frameId: Number.isFinite(candidate.frameId) ? candidate.frameId : 0,
+      shadowPath: normalizeShadowPath(candidate.shadowPath)
+    },
+    candidate,
+    score: scored[0].score
+  };
 }
 
 function createEmptyCollectionRun() {
@@ -813,6 +1220,7 @@ function stopCurrentWork() {
   if (batchRunning || taskPermissionGranted) {
     taskPermissionGranted = false;
     batchRunning = false;
+    stopPendingActionHistory();
     appendResponse("Stopping current action batch...");
   }
 
@@ -857,7 +1265,7 @@ function renderActions() {
     title.className = "action-title";
 
     const step = document.createElement("span");
-    step.textContent = `Step ${index + 1}`;
+    step.textContent = `Step ${index + 1}: ${actionSummary(action)}`;
 
     const type = document.createElement("span");
     type.className = "action-type";
@@ -867,22 +1275,23 @@ function renderActions() {
     risk.className = `risk-badge risk-${action.riskLabel}`;
     risk.textContent = action.riskLabel;
 
-    const pre = document.createElement("pre");
-    pre.textContent = JSON.stringify(action, null, 2);
-
     title.appendChild(step);
     title.appendChild(type);
     title.appendChild(risk);
     div.appendChild(title);
 
-    if (action.riskReasons.length) {
+    const metaLines = [
+      ...(action.riskReasons || []),
+      ...actionMeta(action)
+    ];
+
+    if (metaLines.length) {
       const meta = document.createElement("div");
       meta.className = "action-meta";
-      meta.textContent = action.riskReasons.join(" ");
+      meta.textContent = metaLines.join(" ");
       div.appendChild(meta);
     }
 
-    div.appendChild(pre);
     actionsBox.appendChild(div);
   });
 
@@ -941,6 +1350,153 @@ async function readCurrentPage() {
   return latestPageData;
 }
 
+function actionNeedsPreview(action) {
+  return ["click", "type", "submit"].includes(String(action?.type || ""));
+}
+
+async function previewPageAction(action) {
+  if (!actionNeedsPreview(action)) {
+    return { ok: true, result: "preview skipped" };
+  }
+
+  return sendToBackground({
+    type: "PREVIEW_PAGE_ACTION",
+    action
+  });
+}
+
+async function runPageAction(action) {
+  return sendToBackground({
+    type: "RUN_PAGE_ACTION",
+    action
+  });
+}
+
+function resultError(result) {
+  return result?.error ? String(result.error) : "";
+}
+
+async function retryActionAfterRefresh(action, historyId, originalError, originalPageData) {
+  if (!retryableSelectorError(originalError)) {
+    return {
+      action,
+      result: { error: originalError },
+      attempts: 1,
+      retried: false
+    };
+  }
+
+  updateActionHistoryEntry(historyId, {
+    status: "retrying",
+    attempts: 1,
+    error: originalError,
+    result: "Re-reading page to find the target again."
+  });
+  recordActivity("Retrying action after selector changed", "active");
+
+  const reread = await readCurrentPage();
+
+  if (reread.error) {
+    return {
+      action,
+      result: { error: `${originalError} Retry failed because the page could not be read again: ${reread.error}` },
+      attempts: 1,
+      retried: false
+    };
+  }
+
+  const rematched = rematchAction(action, originalPageData, reread.pageData);
+
+  if (!rematched) {
+    return {
+      action,
+      result: { error: `${originalError} Could not confidently rematch the target after re-reading the page.` },
+      attempts: 1,
+      retried: false
+    };
+  }
+
+  const retryAction = enrichActionForDisplay({
+    ...rematched.action,
+    historyId
+  }, reread.pageData);
+  const rematchNote = `Retried with selector ${compactText(retryAction.selector, 120)}.`;
+
+  updateActionHistoryEntry(historyId, {
+    status: "retrying",
+    attempts: 2,
+    error: "",
+    result: "Target rematched; trying once more.",
+    rematchNote,
+    action: {
+      type: retryAction.type,
+      selector: retryAction.selector,
+      text: retryAction.text || "",
+      frameId: Number.isFinite(retryAction.frameId) ? retryAction.frameId : 0,
+      shadowPath: normalizeShadowPath(retryAction.shadowPath)
+    },
+    meta: actionMeta(retryAction)
+  });
+
+  const preview = await previewPageAction(retryAction);
+  const previewError = resultError(preview);
+
+  if (previewError) {
+    return {
+      action: retryAction,
+      result: { error: `${originalError} Retry preview failed: ${previewError}` },
+      attempts: 2,
+      retried: true,
+      rematchNote
+    };
+  }
+
+  const result = await runPageAction(retryAction);
+
+  return {
+    action: retryAction,
+    result,
+    attempts: 2,
+    retried: true,
+    rematchNote
+  };
+}
+
+async function executeActionWithPreviewAndRetry(action) {
+  const historyId = action.historyId || "";
+  const originalPageData = latestPageData?.pageData;
+  const preview = await previewPageAction(action);
+  const previewError = resultError(preview);
+
+  if (previewError) {
+    return retryActionAfterRefresh(action, historyId, previewError, originalPageData);
+  }
+
+  const result = await runPageAction(action);
+  const actionError = resultError(result);
+
+  if (actionError) {
+    return retryActionAfterRefresh(action, historyId, actionError, originalPageData);
+  }
+
+  return {
+    action,
+    result,
+    attempts: 1,
+    retried: false
+  };
+}
+
+function stopPendingActionHistory(reason = "Stopped before this action ran.") {
+  for (const action of executableActions(pendingActions)) {
+    updateActionHistoryEntry(action.historyId, {
+      status: "stopped",
+      result: reason,
+      error: ""
+    });
+  }
+}
+
 async function postJson(url, body) {
   const res = await fetch(url, {
     method: "POST",
@@ -975,7 +1531,12 @@ function applyAgentFinal(data) {
   pendingActions = [
     ...executable.map(normalizeActionForDisplay),
     ...blocked
-  ];
+  ].map(action => {
+    const enriched = enrichActionForDisplay(action);
+    const status = enriched.riskLabel === "blocked" ? "blocked" : "proposed";
+    const historyId = addActionHistoryEntry(enriched, status);
+    return { ...enriched, historyId };
+  });
 
   const currentText = responseBox.textContent.trim();
   const statusOnly = [
@@ -1338,6 +1899,24 @@ fileInput.addEventListener("change", async () => {
   fileInput.value = "";
 });
 
+includeScreenshotInput.addEventListener("change", updateComposerState);
+
+taskInput.addEventListener("input", () => {
+  resizeTaskInput();
+  saveTaskDraftSoon();
+});
+
+taskInput.addEventListener("keydown", event => {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    if (!askBtn.disabled) askBtn.click();
+  }
+});
+
+if (clearHistoryBtn) {
+  clearHistoryBtn.addEventListener("click", clearActionHistory);
+}
+
 collectionPlaybookBtn.addEventListener("click", () => {
   collectionPlaybookFile.click();
 });
@@ -1518,22 +2097,44 @@ runBatchBtn.addEventListener("click", async () => {
     if (nextIndex === -1) break;
 
     const action = normalizeActionForDisplay(pendingActions.splice(nextIndex, 1)[0]);
-
-    const result = await sendToBackground({
-      type: "RUN_PAGE_ACTION",
-      action
+    runningActionHistoryId = action.historyId || "";
+    updateActionHistoryEntry(runningActionHistoryId, {
+      attempts: 1,
+      result: "Previewing target before running."
     });
 
-    executedActions.push({ action, result });
-    appendResponse(`Action result:\n${JSON.stringify({ action, result }, null, 2)}`);
+    const execution = await executeActionWithPreviewAndRetry(action);
+    const result = execution.result;
+    const finalAction = execution.action || action;
+
+    executedActions.push({ action: finalAction, result });
 
     if (result && result.error) {
-      appendResponse("Stopped because an action failed.");
+      updateActionHistoryEntry(runningActionHistoryId, {
+        status: "failed",
+        attempts: execution.attempts || 1,
+        error: result.error,
+        result: "",
+        rematchNote: execution.rematchNote || ""
+      });
+      appendResponse(`Action failed: ${result.error}`);
       setAgentState("Error", "danger");
+      taskPermissionGranted = false;
+      stopPendingActionHistory("Stopped because a previous action failed.");
       break;
     }
+
+    updateActionHistoryEntry(runningActionHistoryId, {
+      status: "executed",
+      attempts: execution.attempts || 1,
+      result: result?.result || "Action completed.",
+      error: "",
+      rematchNote: execution.rematchNote || ""
+    });
+    appendResponse(`Action completed: ${actionSummary(finalAction)}.`);
   }
 
+  runningActionHistoryId = "";
   batchRunning = false;
   renderActions();
   setBusy(false);
@@ -1553,6 +2154,8 @@ clearBtn.addEventListener("click", () => {
   actionsBox.textContent = "";
   actionsBox.style.display = "none";
   taskInput.value = "";
+  resizeTaskInput();
+  storageRemove(TASK_DRAFT_STORAGE_KEY);
   attachedFiles = [];
   renderAttachments();
   renderActions();
@@ -1562,4 +2165,8 @@ clearBtn.addEventListener("click", () => {
 
 renderAttachments();
 renderCollectionRun();
+loadActionHistory();
+loadTaskDraft();
+updateComposerState();
+resizeTaskInput();
 loadSettings();
