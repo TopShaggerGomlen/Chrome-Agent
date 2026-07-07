@@ -52,7 +52,8 @@
                 <option value="openai_api_key">OpenAI API key</option>
                 <option value="claude_api_key">Claude API key</option>
                 <option value="openai_signin_codex">OpenAI sign-in</option>
-                <option value="local_model">Local model</option>
+                <option value="deepseek_r1_ollama">DeepSeek-R1 via Ollama</option>
+                <option value="gpt_oss_20b_ollama">gpt-oss-20b via Ollama</option>
               </select>
             </label>
 
@@ -65,9 +66,17 @@
               <option value="gpt-5.5-mini"></option>
               <option value="claude-sonnet"></option>
               <option value="claude-sonnet-4-5"></option>
-              <option value="llama3.1"></option>
-              <option value="local-model-name"></option>
+              <option value="deepseek-r1"></option>
+              <option value="deepseek-r1:8b"></option>
+              <option value="deepseek-r1:14b"></option>
+              <option value="deepseek-r1:32b"></option>
+              <option value="gpt-oss:20b"></option>
             </datalist>
+
+            <label id="baseUrlField" class="field" for="baseUrl" style="display:none;">
+              <span>Ollama base URL</span>
+              <input id="baseUrl" placeholder="http://localhost:11434/v1" autocomplete="off" />
+            </label>
 
             <label class="field" for="apiKey">
               <span>API key</span>

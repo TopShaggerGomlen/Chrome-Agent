@@ -1,5 +1,7 @@
 const providerSelect = document.getElementById("provider");
 const modelInput = document.getElementById("model");
+const baseUrlField = document.getElementById("baseUrlField");
+const baseUrlInput = document.getElementById("baseUrl");
 const apiKeyInput = document.getElementById("apiKey");
 const saveSettingsBtn = document.getElementById("saveSettingsBtn");
 const settingsStatus = document.getElementById("settingsStatus");
@@ -81,6 +83,7 @@ function setBusy(isBusy) {
   codexLoginBtn.disabled = isBusy;
   codexCheckBtn.disabled = isBusy;
   attachFileBtn.disabled = isBusy;
+  if (baseUrlInput) baseUrlInput.disabled = isBusy;
   if (settingsToggleBtn) settingsToggleBtn.disabled = isBusy;
   if (apiKeyToggleBtn) apiKeyToggleBtn.disabled = isBusy;
   stopBtn.disabled = !isBusy && !collectionRun.running && !batchRunning;
@@ -1098,19 +1101,33 @@ async function getJson(url) {
   return data;
 }
 
+function isOllamaProvider(provider) {
+  return provider === "deepseek_r1_ollama" || provider === "gpt_oss_20b_ollama";
+}
+
+function defaultBaseUrlForProvider(provider) {
+  return isOllamaProvider(provider) ? "http://localhost:11434/v1" : "";
+}
+
 function defaultModelForProvider(provider) {
   if (provider === "claude_api_key") return "claude-sonnet-4-5";
-  if (provider === "local_model") return "llama3.1";
+  if (provider === "deepseek_r1_ollama") return "deepseek-r1";
+  if (provider === "gpt_oss_20b_ollama") return "gpt-oss:20b";
   return "gpt-5.5";
 }
 
 function updateProviderTools() {
   const isCodexSignin = providerSelect.value === "openai_signin_codex";
+  const isOllama = isOllamaProvider(providerSelect.value);
   codexSigninPanel.style.display = isCodexSignin ? "block" : "none";
+  if (baseUrlField) baseUrlField.style.display = isOllama ? "grid" : "none";
+  if (isOllama && baseUrlInput && !baseUrlInput.value.trim()) {
+    baseUrlInput.value = defaultBaseUrlForProvider(providerSelect.value);
+  }
   apiKeyInput.placeholder = isCodexSignin
     ? "Not required for OpenAI sign-in"
-    : providerSelect.value === "local_model"
-      ? "Optional local API key"
+    : isOllama
+      ? "Optional Ollama API key"
       : "Paste key";
 
   if (!isCodexSignin && codexSigninPollTimer) {
@@ -1180,11 +1197,17 @@ async function loadSettings() {
     const data = await getJson(`${API_BASE}/settings`);
     providerSelect.value = data.provider || "openai_api_key";
     modelInput.value = data.model || data.openaiModel || defaultModelForProvider(providerSelect.value);
+    if (baseUrlInput) {
+      baseUrlInput.value = data.baseUrl || data.ollamaBaseUrl || defaultBaseUrlForProvider(providerSelect.value);
+    }
     setBackendStatus(true, "Connected");
     setStatusLine(settingsStatus, `Provider: ${providerSelect.value}.`, "success");
     updateProviderTools();
   } catch (error) {
     modelInput.value = defaultModelForProvider(providerSelect.value);
+    if (baseUrlInput) {
+      baseUrlInput.value = defaultBaseUrlForProvider(providerSelect.value);
+    }
     setBackendStatus(false, "Offline");
     setStatusLine(settingsStatus, "Backend not connected yet.", "danger");
     providerDisclosure.open = true;
@@ -1218,10 +1241,14 @@ if (apiKeyToggleBtn) {
 
 providerSelect.addEventListener("change", () => {
   const currentModel = modelInput.value.trim();
-  const knownDefaults = ["gpt-5.5", "claude-sonnet-4-5", "llama3.1"];
+  const knownDefaults = ["gpt-5.5", "claude-sonnet-4-5", "deepseek-r1", "gpt-oss:20b"];
 
   if (!currentModel || knownDefaults.includes(currentModel)) {
     modelInput.value = defaultModelForProvider(providerSelect.value);
+  }
+
+  if (baseUrlInput && isOllamaProvider(providerSelect.value) && !baseUrlInput.value.trim()) {
+    baseUrlInput.value = defaultBaseUrlForProvider(providerSelect.value);
   }
 
   updateProviderTools();
@@ -1235,11 +1262,13 @@ saveSettingsBtn.addEventListener("click", async () => {
     const provider = providerSelect.value;
     const model = modelInput.value.trim();
     const apiKey = apiKeyInput.value.trim();
+    const baseUrl = baseUrlInput ? baseUrlInput.value.trim() : "";
 
     const data = await postJson(`${API_BASE}/settings`, {
       provider,
       model,
-      apiKey
+      apiKey,
+      baseUrl
     });
 
     apiKeyInput.value = "";

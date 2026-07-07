@@ -18,7 +18,9 @@ const RUNTIME_SECRETS_PATH = path.join(__dirname, ".runtime-secrets.json");
 const LOCAL_CODEX_CLI_PATH = path.join(__dirname, "node_modules", "@openai", "codex", "bin", "codex.js");
 
 const PORT = Number(process.env.PORT || 3000);
-const PROVIDERS = new Set(["openai_api_key", "claude_api_key", "openai_signin_codex", "local_model"]);
+const OLLAMA_PROVIDERS = new Set(["deepseek_r1_ollama", "gpt_oss_20b_ollama"]);
+const PROVIDER_ALIASES = new Map([["local_model", "deepseek_r1_ollama"]]);
+const PROVIDERS = new Set(["openai_api_key", "claude_api_key", "openai_signin_codex", ...OLLAMA_PROVIDERS]);
 const ACTION_TYPES = new Set(["click", "type", "submit", "extract"]);
 const COLLECTION_ACTION_TYPES = new Set([
   "scroll",
@@ -266,8 +268,41 @@ function writeRuntimeSecrets(secrets) {
 }
 
 function normalizeProvider(provider) {
+  if (provider && PROVIDER_ALIASES.has(provider)) return PROVIDER_ALIASES.get(provider);
   if (provider && PROVIDERS.has(provider)) return provider;
   return "openai_api_key";
+}
+
+function isRecognizedProvider(provider) {
+  return Boolean(provider && (PROVIDERS.has(provider) || PROVIDER_ALIASES.has(provider)));
+}
+
+function isOllamaProvider(provider) {
+  return OLLAMA_PROVIDERS.has(provider);
+}
+
+function providerSupportsScreenshot(provider) {
+  return provider === "openai_api_key" || provider === "claude_api_key";
+}
+
+function screenshotOmittedWarning(provider) {
+  if (provider === "openai_signin_codex") {
+    return "Screenshot context is omitted for OpenAI sign-in through Codex CLI mode.";
+  }
+
+  if (isOllamaProvider(provider)) {
+    return "Screenshot context is omitted for Ollama self-hosted model modes.";
+  }
+
+  return "";
+}
+
+function modelForSettings(settings) {
+  if (settings.provider === "claude_api_key") return settings.anthropicModel;
+  if (settings.provider === "openai_signin_codex") return settings.codexModel;
+  if (settings.provider === "deepseek_r1_ollama") return settings.deepseekR1Model;
+  if (settings.provider === "gpt_oss_20b_ollama") return settings.gptOss20bModel;
+  return settings.openaiModel;
 }
 
 function resolveCodexInvocation(commandOverride) {
@@ -291,22 +326,36 @@ function resolveCodexInvocation(commandOverride) {
 
 function getEffectiveSettings(requestedProvider) {
   const localSecrets = readRuntimeSecrets();
-  const provider = normalizeProvider(
-    requestedProvider ||
+  const requested = requestedProvider ||
     localSecrets.provider ||
-    process.env.RUNTIME_PROVIDER
+    process.env.RUNTIME_PROVIDER;
+  const provider = normalizeProvider(
+    requested
   );
   const codexInvocation = resolveCodexInvocation(localSecrets.codexCommand || process.env.CODEX_CLI_COMMAND);
+  const legacyLocalModel = normalizeProvider(localSecrets.provider || process.env.RUNTIME_PROVIDER) === provider
+    ? localSecrets.localModel || process.env.LOCAL_MODEL || ""
+    : "";
+  const deepseekR1Model = localSecrets.deepseekR1Model ||
+    process.env.DEEPSEEK_R1_MODEL ||
+    (provider === "deepseek_r1_ollama" ? legacyLocalModel : "") ||
+    "deepseek-r1";
+  const gptOss20bModel = localSecrets.gptOss20bModel ||
+    process.env.GPT_OSS_20B_MODEL ||
+    (provider === "gpt_oss_20b_ollama" ? legacyLocalModel : "") ||
+    "gpt-oss:20b";
 
   return {
     provider,
     openaiApiKey: localSecrets.openaiApiKey || process.env.OPENAI_API_KEY || "",
     anthropicApiKey: localSecrets.anthropicApiKey || process.env.ANTHROPIC_API_KEY || "",
-    localModelApiKey: localSecrets.localModelApiKey || process.env.LOCAL_MODEL_API_KEY || "ollama",
-    localModelBaseUrl: localSecrets.localModelBaseUrl || process.env.LOCAL_MODEL_BASE_URL || "http://localhost:11434/v1",
+    ollamaApiKey: localSecrets.ollamaApiKey || localSecrets.localModelApiKey || process.env.OLLAMA_API_KEY || process.env.LOCAL_MODEL_API_KEY || "ollama",
+    ollamaBaseUrl: localSecrets.ollamaBaseUrl || localSecrets.localModelBaseUrl || process.env.OLLAMA_BASE_URL || process.env.LOCAL_MODEL_BASE_URL || "http://localhost:11434/v1",
     openaiModel: localSecrets.openaiModel || process.env.OPENAI_MODEL || "gpt-5.5",
     anthropicModel: localSecrets.anthropicModel || process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5",
-    localModel: localSecrets.localModel || process.env.LOCAL_MODEL || "llama3.1",
+    deepseekR1Model,
+    gptOss20bModel,
+    ollamaModel: provider === "gpt_oss_20b_ollama" ? gptOss20bModel : deepseekR1Model,
     codexCommand: codexInvocation.command,
     codexBaseArgs: codexInvocation.baseArgs,
     codexCommandLabel: codexInvocation.label,
@@ -849,7 +898,7 @@ function buildCollectionPrompt({ task, fields, playbook, limits, runState, page,
 }
 
 function extractJson(raw) {
-  const text = String(raw || "").trim();
+  const text = stripReasoningTags(raw);
   if (!text) return null;
 
   const withoutFence = text
@@ -947,6 +996,64 @@ function dataUrlParts(dataUrl) {
   return { mediaType: match[1], base64: match[2] };
 }
 
+function stripReasoningTags(value) {
+  return String(value || "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<\|begin_of_thought\|>[\s\S]*?<\|end_of_thought\|>/gi, "")
+    .trim();
+}
+
+function createReasoningTagFilter() {
+  let buffer = "";
+  let insideThink = false;
+  const startTag = "<think>";
+  const endTag = "</think>";
+  const keepChars = Math.max(startTag.length, endTag.length) - 1;
+
+  return {
+    push(delta) {
+      buffer += String(delta || "");
+      let output = "";
+
+      while (buffer) {
+        const lower = buffer.toLowerCase();
+
+        if (insideThink) {
+          const endIndex = lower.indexOf(endTag);
+          if (endIndex === -1) {
+            buffer = buffer.slice(-keepChars);
+            break;
+          }
+
+          buffer = buffer.slice(endIndex + endTag.length);
+          insideThink = false;
+          continue;
+        }
+
+        const startIndex = lower.indexOf(startTag);
+        if (startIndex === -1) {
+          const emitLength = Math.max(0, buffer.length - keepChars);
+          output += buffer.slice(0, emitLength);
+          buffer = buffer.slice(emitLength);
+          break;
+        }
+
+        output += buffer.slice(0, startIndex);
+        buffer = buffer.slice(startIndex + startTag.length);
+        insideThink = true;
+      }
+
+      return output;
+    },
+    flush() {
+      const output = insideThink ? "" : buffer;
+      buffer = "";
+      insideThink = false;
+      return output;
+    }
+  };
+}
+
 function openAIInput(input, screenshot) {
   if (!screenshot?.dataUrl) return input;
 
@@ -1018,30 +1125,43 @@ async function callClaude({ instructions, input, settings, screenshot }) {
   return textBlock?.text || "";
 }
 
-function localModelClient(settings) {
-  if (!settings.localModelBaseUrl) {
-    throw new Error("Missing local model base URL. Set LOCAL_MODEL_BASE_URL in server/.env.");
+function ollamaClient(settings) {
+  if (!settings.ollamaBaseUrl) {
+    throw new Error("Missing Ollama base URL. Set OLLAMA_BASE_URL in server/.env.");
   }
 
   return new OpenAI({
-    apiKey: settings.localModelApiKey || "ollama",
-    baseURL: settings.localModelBaseUrl
+    apiKey: settings.ollamaApiKey || "ollama",
+    baseURL: settings.ollamaBaseUrl
   });
 }
 
-async function callLocalModel({ instructions, input, settings }) {
-  const client = localModelClient(settings);
+function ollamaMessages({ instructions, input, provider }) {
+  if (provider === "deepseek_r1_ollama") {
+    return [
+      {
+        role: "user",
+        content: `${instructions}\n\n${input}`
+      }
+    ];
+  }
+
+  return [
+    { role: "system", content: instructions },
+    { role: "user", content: input }
+  ];
+}
+
+async function callOllamaModel({ provider, instructions, input, settings }) {
+  const client = ollamaClient(settings);
 
   const response = await client.chat.completions.create({
-    model: settings.localModel,
+    model: settings.ollamaModel,
     temperature: 0.2,
-    messages: [
-      { role: "system", content: instructions },
-      { role: "user", content: input }
-    ]
+    messages: ollamaMessages({ instructions, input, provider })
   });
 
-  return response.choices?.[0]?.message?.content || "";
+  return stripReasoningTags(response.choices?.[0]?.message?.content || "");
 }
 
 async function callOpenAISigninCodex({ instructions, input, settings, signal }) {
@@ -1078,8 +1198,8 @@ async function callSelectedProvider({ provider, instructions, input, settings, s
     return callOpenAISigninCodex({ instructions, input, settings, signal });
   }
 
-  if (provider === "local_model") {
-    return callLocalModel({ instructions, input, settings });
+  if (isOllamaProvider(provider)) {
+    return callOllamaModel({ provider, instructions, input, settings });
   }
 
   throw new Error(`Unsupported provider: ${provider}`);
@@ -1169,17 +1289,15 @@ async function* streamClaudeReply({ instructions, input, settings, screenshot, s
   }
 }
 
-async function* streamLocalModelReply({ instructions, input, settings, signal }) {
-  const client = localModelClient(settings);
+async function* streamOllamaReply({ provider, instructions, input, settings, signal }) {
+  const client = ollamaClient(settings);
+  const reasoningFilter = createReasoningTagFilter();
   const stream = await client.chat.completions.create(
     {
-      model: settings.localModel,
+      model: settings.ollamaModel,
       temperature: 0.2,
       stream: true,
-      messages: [
-        { role: "system", content: instructions },
-        { role: "user", content: input }
-      ]
+      messages: ollamaMessages({ instructions, input, provider })
     },
     { signal }
   );
@@ -1188,7 +1306,13 @@ async function* streamLocalModelReply({ instructions, input, settings, signal })
     if (signal?.aborted) throw new Error("Request aborted.");
 
     const delta = chunk.choices?.[0]?.delta?.content;
-    if (delta) yield delta;
+    const cleanDelta = reasoningFilter.push(delta);
+    if (cleanDelta) yield cleanDelta;
+  }
+
+  const finalDelta = reasoningFilter.flush();
+  if (finalDelta) {
+    yield stripReasoningTags(finalDelta);
   }
 }
 
@@ -1295,13 +1419,11 @@ async function buildAgentFinalResponse({ body, signal }) {
   const page = normalizePage(rawPage);
   const attachedFiles = normalizeAttachments(files);
   const warnings = [...page.warnings];
+  const modelScreenshot = providerSupportsScreenshot(settings.provider) ? page.screenshot : null;
+  const omittedScreenshotWarning = screenshotOmittedWarning(settings.provider);
 
-  if (settings.provider === "openai_signin_codex" && page.screenshot) {
-    warnings.push("Screenshot context is omitted for OpenAI sign-in through Codex CLI mode.");
-  }
-
-  if (settings.provider === "local_model" && page.screenshot) {
-    warnings.push("Screenshot context is omitted for local model mode.");
+  if (!modelScreenshot && page.screenshot && omittedScreenshotWarning) {
+    warnings.push(omittedScreenshotWarning);
   }
 
   if (taskIsHighRisk(task)) {
@@ -1324,7 +1446,7 @@ async function buildAgentFinalResponse({ body, signal }) {
     pageChunks: page.chunks,
     pageWarnings: page.warnings,
     accessibility: page.accessibility,
-    screenshot: page.screenshot,
+    screenshot: modelScreenshot,
     attachedFiles,
     allowSubmit
   });
@@ -1334,7 +1456,7 @@ async function buildAgentFinalResponse({ body, signal }) {
     instructions,
     input,
     settings,
-    screenshot: settings.provider === "openai_signin_codex" ? null : page.screenshot,
+    screenshot: modelScreenshot,
     signal
   });
 
@@ -1372,38 +1494,34 @@ app.get("/settings", (req, res) => {
 
   res.json({
     provider: settings.provider,
-    model:
-      settings.provider === "claude_api_key"
-        ? settings.anthropicModel
-        : settings.provider === "openai_signin_codex"
-          ? settings.codexModel
-          : settings.provider === "local_model"
-            ? settings.localModel
-            : settings.openaiModel,
+    model: modelForSettings(settings),
     openaiModel: settings.openaiModel,
     anthropicModel: settings.anthropicModel,
-    localModel: settings.localModel,
-    localModelBaseUrl: settings.localModelBaseUrl,
+    deepseekR1Model: settings.deepseekR1Model,
+    gptOss20bModel: settings.gptOss20bModel,
+    ollamaModel: settings.ollamaModel,
+    ollamaBaseUrl: settings.ollamaBaseUrl,
+    baseUrl: isOllamaProvider(settings.provider) ? settings.ollamaBaseUrl : "",
     codexModel: settings.codexModel,
     hasOpenAIKey: Boolean(settings.openaiApiKey),
     hasClaudeKey: Boolean(settings.anthropicApiKey),
-    hasLocalModelKey: Boolean(settings.localModelApiKey)
+    hasOllamaKey: Boolean(settings.ollamaApiKey)
   });
 });
 
 app.post("/settings", (req, res) => {
-  const { provider, model, apiKey } = req.body || {};
+  const { provider, model, apiKey, baseUrl } = req.body || {};
 
-  if (provider && !PROVIDERS.has(provider)) {
+  if (provider && !isRecognizedProvider(provider)) {
     return res.status(400).json({ error: "Invalid provider." });
   }
 
   const current = readRuntimeSecrets();
   const next = { ...current };
-  const normalizedProvider = provider || current.provider || process.env.RUNTIME_PROVIDER || "openai_api_key";
+  const normalizedProvider = normalizeProvider(provider || current.provider || process.env.RUNTIME_PROVIDER || "openai_api_key");
 
   if (provider) {
-    next.provider = provider;
+    next.provider = normalizedProvider;
   }
 
   if (normalizedProvider === "openai_api_key") {
@@ -1420,9 +1538,11 @@ app.post("/settings", (req, res) => {
     if (model) next.codexModel = model;
   }
 
-  if (normalizedProvider === "local_model") {
-    if (apiKey) next.localModelApiKey = apiKey;
-    if (model) next.localModel = model;
+  if (isOllamaProvider(normalizedProvider)) {
+    if (apiKey) next.ollamaApiKey = apiKey;
+    if (baseUrl) next.ollamaBaseUrl = baseUrl;
+    if (model && normalizedProvider === "deepseek_r1_ollama") next.deepseekR1Model = model;
+    if (model && normalizedProvider === "gpt_oss_20b_ollama") next.gptOss20bModel = model;
   }
 
   writeRuntimeSecrets(next);
@@ -1432,8 +1552,8 @@ app.post("/settings", (req, res) => {
     provider: normalizeProvider(next.provider),
     message: normalizedProvider === "openai_signin_codex"
       ? "Make sure `codex login` has been completed locally."
-      : normalizedProvider === "local_model"
-        ? "Local model mode saved. Set LOCAL_MODEL_BASE_URL in server/.env if needed."
+      : isOllamaProvider(normalizedProvider)
+        ? "Ollama provider saved. Make sure Ollama is running and the selected model is pulled."
         : "API key mode saved locally on the backend."
   });
 });
@@ -1618,6 +1738,12 @@ app.post("/collection/step", async (req, res) => {
     const requestedFields = normalizeCollectionFields(fields);
     const attachedFiles = normalizeAttachments(files);
     const page = normalizePage(rawPage);
+    const modelScreenshot = providerSupportsScreenshot(settings.provider) ? page.screenshot : null;
+    const omittedScreenshotWarning = screenshotOmittedWarning(settings.provider);
+    const requestWarnings = !modelScreenshot && page.screenshot && omittedScreenshotWarning
+      ? [omittedScreenshotWarning]
+      : [];
+    const promptPage = modelScreenshot === page.screenshot ? page : { ...page, screenshot: null };
 
     if (taskIsHighRisk(task)) {
       return res.json({
@@ -1626,7 +1752,7 @@ app.post("/collection/step", async (req, res) => {
         actions: [],
         rows: [],
         fields: requestedFields,
-        warnings: ["High-risk task blocked before any model call."],
+        warnings: [...requestWarnings, "High-risk task blocked before any model call."],
         blockedActions: [],
         nextRecordHint: "",
         stopReason: "high_risk_task",
@@ -1640,7 +1766,7 @@ app.post("/collection/step", async (req, res) => {
       playbook,
       limits,
       runState: runState && typeof runState === "object" ? runState : {},
-      page,
+      page: promptPage,
       attachedFiles
     });
 
@@ -1649,7 +1775,7 @@ app.post("/collection/step", async (req, res) => {
       instructions,
       input,
       settings,
-      screenshot: settings.provider === "openai_signin_codex" ? null : page.screenshot
+      screenshot: modelScreenshot
     });
     const parsed = extractJson(raw);
 
@@ -1660,7 +1786,7 @@ app.post("/collection/step", async (req, res) => {
         actions: [],
         rows: [],
         fields: requestedFields,
-        warnings: ["Model did not return valid collection JSON."],
+        warnings: [...requestWarnings, "Model did not return valid collection JSON."],
         blockedActions: [],
         nextRecordHint: "",
         stopReason: "",
@@ -1674,6 +1800,7 @@ app.post("/collection/step", async (req, res) => {
     const warnings = Array.isArray(parsed.warnings)
       ? parsed.warnings.map(warning => safeText(warning, 500)).filter(Boolean)
       : [];
+    warnings.unshift(...requestWarnings);
 
     if (blockedActions.length) {
       warnings.push(`${blockedActions.length} proposed action(s) were blocked by validation.`);
@@ -1704,7 +1831,7 @@ app.post("/agent/stream", async (req, res) => {
   const abortController = new AbortController();
   let responseEnded = false;
 
-  req.on("close", () => {
+  res.on("close", () => {
     if (!responseEnded) abortController.abort();
   });
 
@@ -1729,13 +1856,11 @@ app.post("/agent/stream", async (req, res) => {
     const page = normalizePage(rawPage);
     const attachedFiles = normalizeAttachments(files);
     const warnings = [...page.warnings];
+    const modelScreenshot = providerSupportsScreenshot(settings.provider) ? page.screenshot : null;
+    const omittedScreenshotWarning = screenshotOmittedWarning(settings.provider);
 
-    if (settings.provider === "openai_signin_codex" && page.screenshot) {
-      warnings.push("Screenshot context is omitted for OpenAI sign-in through Codex CLI mode.");
-    }
-
-    if (settings.provider === "local_model" && page.screenshot) {
-      warnings.push("Screenshot context is omitted for local model mode.");
+    if (!modelScreenshot && page.screenshot && omittedScreenshotWarning) {
+      warnings.push(omittedScreenshotWarning);
     }
 
     sendSse(res, "status", { message: "Reading page context..." });
@@ -1773,7 +1898,11 @@ app.post("/agent/stream", async (req, res) => {
       return;
     }
 
-    const replyPrompt = buildReplyPrompt({ task, page, attachedFiles });
+    const replyPrompt = buildReplyPrompt({
+      task,
+      page: modelScreenshot === page.screenshot ? page : { ...page, screenshot: null },
+      attachedFiles
+    });
     let streamedReply = "";
 
     sendSse(res, "status", { message: "Streaming reply..." });
@@ -1783,11 +1912,12 @@ app.post("/agent/stream", async (req, res) => {
         instructions: replyPrompt.instructions,
         input: replyPrompt.input,
         settings,
-        screenshot: page.screenshot,
+        screenshot: modelScreenshot,
         signal: abortController.signal
       })
-      : settings.provider === "local_model"
-        ? streamLocalModelReply({
+      : isOllamaProvider(settings.provider)
+        ? streamOllamaReply({
+          provider: settings.provider,
           instructions: replyPrompt.instructions,
           input: replyPrompt.input,
           settings,
@@ -1797,7 +1927,7 @@ app.post("/agent/stream", async (req, res) => {
           instructions: replyPrompt.instructions,
           input: replyPrompt.input,
           settings,
-          screenshot: page.screenshot,
+          screenshot: modelScreenshot,
           signal: abortController.signal
         });
 

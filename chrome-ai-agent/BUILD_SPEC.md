@@ -13,6 +13,8 @@ This updated version includes these user requirements:
    - Claude API key
    - OpenAI API key
    - OpenAI sign-in through the local Codex CLI, as an experimental local-only mode
+   - DeepSeek-R1 through a local Ollama OpenAI-compatible API
+   - gpt-oss-20b through a local Ollama OpenAI-compatible API
 
 Important: **Codex is used to build the project. Codex is not required as the runtime model unless the user chooses the experimental “OpenAI sign-in / Codex CLI” provider.**
 
@@ -29,6 +31,8 @@ The agent should:
    - `openai_api_key`
    - `claude_api_key`
    - `openai_signin_codex`
+   - `deepseek_r1_ollama`
+   - `gpt_oss_20b_ollama`
 3. Let the user type tasks such as:
    - `Summarize this page.`
    - `Find the login button.`
@@ -113,6 +117,14 @@ Limitations:
 - This mode is not recommended for production browser-agent deployment.
 - Do not scrape ChatGPT browser cookies or automate the ChatGPT website. Only use the official local Codex CLI sign-in flow.
 
+### 3.4 `deepseek_r1_ollama`
+
+Self-hosted local mode using Ollama's OpenAI-compatible Chat Completions API. The default base URL is `http://localhost:11434/v1` and the default model is `deepseek-r1`.
+
+### 3.5 `gpt_oss_20b_ollama`
+
+Self-hosted local mode using Ollama's OpenAI-compatible Chat Completions API. The default base URL is `http://localhost:11434/v1` and the default model is `gpt-oss:20b`.
+
 ---
 
 ## 4. Main safety rules
@@ -160,6 +172,7 @@ Use:
 - Express server
 - OpenAI JavaScript SDK
 - Anthropic JavaScript SDK
+- Ollama for local DeepSeek-R1 and gpt-oss-20b serving
 - Optional Codex CLI adapter for OpenAI sign-in mode
 - `.env` and `.runtime-secrets.json` for local credentials
 

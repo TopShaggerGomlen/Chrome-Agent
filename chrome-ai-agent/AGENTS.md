@@ -12,6 +12,8 @@ Follow these rules:
    - `openai_api_key`
    - `claude_api_key`
    - `openai_signin_codex`
+   - `deepseek_r1_ollama`
+   - `gpt_oss_20b_ollama`
 4. Do not add a domain allowlist. The extension should use `<all_urls>`.
 5. Ask permission once per task/action batch, not before every action.
 6. Allow submit actions only when the user explicitly asks to submit/send/post/search/confirm.

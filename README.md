@@ -15,6 +15,8 @@ A local MVP Chrome extension that opens in the Chrome side panel, reads the curr
 - Supports OpenAI API key mode
 - Supports Claude API key mode
 - Supports experimental OpenAI sign-in mode through local Codex CLI
+- Supports self-hosted DeepSeek-R1 through Ollama
+- Supports self-hosted gpt-oss-20b through Ollama
 - Supports text file attachments from the side-panel composer
 - Supports playbook-driven Collection Mode for longer website extraction runs
 - Exports collected rows as Markdown
@@ -35,6 +37,7 @@ A local MVP Chrome extension that opens in the Chrome side panel, reads the curr
   - OpenAI API key
   - Claude API key
   - Codex CLI installed and signed in with ChatGPT
+  - Ollama with `deepseek-r1` or `gpt-oss:20b` pulled locally
 
 ## Setup
 
@@ -83,6 +86,32 @@ Then use:
 RUNTIME_PROVIDER=openai_signin_codex
 CODEX_CLI_COMMAND=codex
 CODEX_MODEL=gpt-5.5
+```
+
+For DeepSeek-R1 through Ollama:
+
+```bash
+ollama pull deepseek-r1
+```
+
+```env
+RUNTIME_PROVIDER=deepseek_r1_ollama
+OLLAMA_BASE_URL=http://localhost:11434/v1
+OLLAMA_API_KEY=ollama
+DEEPSEEK_R1_MODEL=deepseek-r1
+```
+
+For gpt-oss-20b through Ollama:
+
+```bash
+ollama pull gpt-oss:20b
+```
+
+```env
+RUNTIME_PROVIDER=gpt_oss_20b_ollama
+OLLAMA_BASE_URL=http://localhost:11434/v1
+OLLAMA_API_KEY=ollama
+GPT_OSS_20B_MODEL=gpt-oss:20b
 ```
 
 ### 3. Start backend
@@ -137,7 +166,7 @@ Fill the contact form with "Hello, I am interested in your service" and submit i
 
 You can also attach text-based files from the composer, such as `.txt`, `.md`, `.json`, `.csv`, source files, or logs. The MVP sends bounded text excerpts to the backend as extra context; binary files such as PDFs or images are not parsed.
 
-Enable **Screenshot** in the composer when you want the current visible tab image included as extra context. Screenshots are opt-in per request. OpenAI and Claude API-key modes can receive screenshot image input; OpenAI sign-in through Codex CLI mode omits screenshot image input and uses the text/accessibility context instead.
+Enable **Screenshot** in the composer when you want the current visible tab image included as extra context. Screenshots are opt-in per request. OpenAI and Claude API-key modes can receive screenshot image input; OpenAI sign-in through Codex CLI and Ollama self-hosted modes omit screenshot image input and use the text/accessibility context instead.
 
 Use **Stop** to cancel an in-flight streaming request, stop before the next action in a running batch, or request that Collection Mode stop after the current step.
 
@@ -191,6 +220,18 @@ The side panel also includes **Open OpenAI Sign-In** when this provider is selec
 
 Codex CLI mode emits progress/status events and then a final response. It does not stream model tokens through the side panel, and screenshot image input is omitted.
 
+### DeepSeek-R1 through Ollama
+
+Uses Ollama's local OpenAI-compatible Chat Completions API at `OLLAMA_BASE_URL`, defaulting to `http://localhost:11434/v1`. Pull the model with `ollama pull deepseek-r1`, then select **DeepSeek-R1 via Ollama** in the side panel or set `RUNTIME_PROVIDER=deepseek_r1_ollama`.
+
+Ask replies stream token-by-token where supported. Screenshot image input is omitted for this text-only provider.
+
+### gpt-oss-20b through Ollama
+
+Uses Ollama's local OpenAI-compatible Chat Completions API at `OLLAMA_BASE_URL`, defaulting to `http://localhost:11434/v1`. Pull the model with `ollama pull gpt-oss:20b`, then select **gpt-oss-20b via Ollama** in the side panel or set `RUNTIME_PROVIDER=gpt_oss_20b_ollama`.
+
+Ask replies stream token-by-token where supported. Screenshot image input is omitted for this text-only provider.
+
 ## Known limitations
 
 - Chrome internal pages such as `chrome://extensions` are not accessible to content scripts.
@@ -242,6 +283,8 @@ Claude:
 RUNTIME_PROVIDER=claude_api_key
 ANTHROPIC_API_KEY=your_key
 ```
+
+Ollama providers do not usually need a real API key. Keep `OLLAMA_API_KEY=ollama` unless your local Ollama-compatible server requires a different bearer token.
 
 ### OpenAI sign-in mode fails
 
