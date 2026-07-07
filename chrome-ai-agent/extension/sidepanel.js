@@ -9,6 +9,10 @@ const codexLoginBtn = document.getElementById("codexLoginBtn");
 const codexCheckBtn = document.getElementById("codexCheckBtn");
 const codexSigninStatus = document.getElementById("codexSigninStatus");
 const providerDisclosure = document.getElementById("providerDisclosure");
+const settingsToggleBtn = document.getElementById("settingsToggleBtn");
+const apiKeyToggleBtn = document.getElementById("apiKeyToggleBtn");
+const agentStateTitle = document.getElementById("agentStateTitle");
+const activityTimeline = document.getElementById("activityTimeline");
 
 const taskInput = document.getElementById("task");
 const askBtn = document.getElementById("askBtn");
@@ -53,6 +57,7 @@ const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_BYTES = 512 * 1024;
 const MAX_ATTACHMENT_CHARS = 12000;
 const MAX_TOTAL_ATTACHMENT_CHARS = 30000;
+const ACTIVITY_LIMIT = 8;
 
 let pendingActions = [];
 let executedActions = [];
@@ -76,11 +81,21 @@ function setBusy(isBusy) {
   codexLoginBtn.disabled = isBusy;
   codexCheckBtn.disabled = isBusy;
   attachFileBtn.disabled = isBusy;
+  if (settingsToggleBtn) settingsToggleBtn.disabled = isBusy;
+  if (apiKeyToggleBtn) apiKeyToggleBtn.disabled = isBusy;
   stopBtn.disabled = !isBusy && !collectionRun.running && !batchRunning;
 }
 
 function appendResponse(text) {
   responseBox.textContent += `\n\n${text}`;
+  updateAgentStateFromMessage(text);
+
+  const clean = String(text || "").trim();
+  if (clean.startsWith("Action result:")) {
+    recordActivity("Action result received", clean.includes("\"error\"") ? "danger" : "success");
+  } else if (clean) {
+    recordActivity(clean);
+  }
 }
 
 function setStatusLine(element, text, tone = "") {
@@ -90,6 +105,10 @@ function setStatusLine(element, text, tone = "") {
   if (tone) {
     element.classList.add(tone);
   }
+
+  if (element === settingsStatus || element === codexSigninStatus || element === collectionStatus) {
+    updateAgentStateFromMessage(text);
+  }
 }
 
 function setBackendStatus(isConnected, text) {
@@ -97,6 +116,96 @@ function setBackendStatus(isConnected, text) {
   backendStatus.classList.toggle("connected", isConnected);
   backendStatus.classList.toggle("offline", !isConnected);
   backendStatus.title = isConnected ? "Local backend is reachable." : "Local backend is not reachable.";
+  recordActivity(isConnected ? "Backend connected" : "Backend offline", isConnected ? "success" : "danger");
+}
+
+function setAgentState(label, tone = "") {
+  if (!agentStateTitle) return;
+
+  agentStateTitle.textContent = label;
+  agentStateTitle.classList.remove("is-error", "is-success");
+
+  if (tone === "danger") {
+    agentStateTitle.classList.add("is-error");
+  } else if (tone === "success") {
+    agentStateTitle.classList.add("is-success");
+  }
+}
+
+function activityTimestamp() {
+  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function activityToneFromMessage(message, fallback = "") {
+  const text = String(message || "").toLowerCase();
+
+  if (fallback) return fallback;
+  if (text.includes("error") || text.includes("failed") || text.includes("could not") || text.includes("stopped")) return "danger";
+  if (text.includes("complete") || text.includes("success") || text.includes("saved")) return "success";
+  if (text.includes("reading") || text.includes("thinking") || text.includes("planning") || text.includes("running")) return "active";
+  return "";
+}
+
+function recordActivity(message, tone = "") {
+  if (!activityTimeline) return;
+
+  const clean = String(message || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
+
+  if (!clean) return;
+
+  const lastEntry = activityTimeline.lastElementChild?.querySelector(".activity-message")?.textContent || "";
+  if (lastEntry === clean) return;
+
+  const entry = document.createElement("li");
+  entry.className = `activity-entry ${activityToneFromMessage(clean, tone)}`.trim();
+
+  const node = document.createElement("span");
+  node.className = "activity-node";
+  node.setAttribute("aria-hidden", "true");
+
+  const time = document.createElement("span");
+  time.className = "activity-time";
+  time.textContent = activityTimestamp();
+
+  const copy = document.createElement("span");
+  copy.className = "activity-message";
+  copy.textContent = clean;
+
+  entry.appendChild(node);
+  entry.appendChild(time);
+  entry.appendChild(copy);
+  activityTimeline.appendChild(entry);
+
+  while (activityTimeline.children.length > ACTIVITY_LIMIT) {
+    activityTimeline.firstElementChild?.remove();
+  }
+
+  activityTimeline.scrollTop = activityTimeline.scrollHeight;
+}
+
+function updateAgentStateFromMessage(message) {
+  const text = String(message || "").toLowerCase();
+
+  if (!text) return;
+
+  if (text.includes("waiting for permission") || text.includes("permission granted")) {
+    setAgentState("Waiting for permission", "active");
+  } else if (text.includes("running action") || text.includes("running actions") || text.includes("action result")) {
+    setAgentState("Running browser action", "active");
+  } else if (text.includes("reading page") || text.includes("page read")) {
+    setAgentState("Reading page", "active");
+  } else if (text.includes("thinking") || text.includes("streaming") || text.includes("planning")) {
+    setAgentState("Thinking", "active");
+  } else if (text.includes("error") || text.includes("failed") || text.includes("could not")) {
+    setAgentState("Error", "danger");
+  } else if (text.includes("complete") || text.includes("success") || text.includes("saved")) {
+    setAgentState("Completed", "success");
+  } else if (text.includes("ready")) {
+    setAgentState("Ready");
+  }
 }
 
 function formatBytes(bytes) {
@@ -318,6 +427,7 @@ function addCollectionLog(message) {
 
 function setCollectionStatus(text, tone = "") {
   setStatusLine(collectionStatus, text, tone);
+  recordActivity(text, tone || (String(text).toLowerCase().includes("running") ? "active" : ""));
 }
 
 function setCollectionControls() {
@@ -946,7 +1056,11 @@ async function streamAgentRequest(payload) {
       const { event, data } = parseSseBlock(block);
 
       if (event === "status") {
-        if (data.message && !sawDelta) responseBox.textContent = data.message;
+        if (data.message && !sawDelta) {
+          responseBox.textContent = data.message;
+          updateAgentStateFromMessage(data.message);
+          recordActivity(data.message, "active");
+        }
       } else if (event === "delta") {
         if (!sawDelta) {
           responseBox.textContent = "";
@@ -956,7 +1070,11 @@ async function streamAgentRequest(payload) {
       } else if (event === "final") {
         sawFinal = true;
         applyAgentFinal(data);
+        setAgentState("Completed", "success");
+        recordActivity("Response completed", "success");
       } else if (event === "error") {
+        setAgentState("Error", "danger");
+        recordActivity(data.error || data.message || "Streaming request failed", "danger");
         throw new Error(data.error || data.message || "Streaming request failed.");
       }
     }
@@ -982,12 +1100,18 @@ async function getJson(url) {
 
 function defaultModelForProvider(provider) {
   if (provider === "claude_api_key") return "claude-sonnet-4-5";
+  if (provider === "local_model") return "llama3.1";
   return "gpt-5.5";
 }
 
 function updateProviderTools() {
   const isCodexSignin = providerSelect.value === "openai_signin_codex";
   codexSigninPanel.style.display = isCodexSignin ? "block" : "none";
+  apiKeyInput.placeholder = isCodexSignin
+    ? "Not required for OpenAI sign-in"
+    : providerSelect.value === "local_model"
+      ? "Optional local API key"
+      : "Paste key";
 
   if (!isCodexSignin && codexSigninPollTimer) {
     clearInterval(codexSigninPollTimer);
@@ -1068,8 +1192,35 @@ async function loadSettings() {
   }
 }
 
+document.querySelectorAll("[data-no-summary-toggle] button").forEach(button => {
+  button.addEventListener("click", event => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+});
+
+if (settingsToggleBtn) {
+  settingsToggleBtn.addEventListener("click", () => {
+    providerDisclosure.open = true;
+    modelInput.focus({ preventScroll: true });
+    recordActivity("Opened provider settings");
+  });
+}
+
+if (apiKeyToggleBtn) {
+  apiKeyToggleBtn.addEventListener("click", () => {
+    const shouldShow = apiKeyInput.type === "password";
+    apiKeyInput.type = shouldShow ? "text" : "password";
+    apiKeyToggleBtn.textContent = shouldShow ? "Hide" : "Show";
+    apiKeyToggleBtn.setAttribute("aria-label", shouldShow ? "Hide API key" : "Show API key");
+  });
+}
+
 providerSelect.addEventListener("change", () => {
-  if (!modelInput.value.trim()) {
+  const currentModel = modelInput.value.trim();
+  const knownDefaults = ["gpt-5.5", "claude-sonnet-4-5", "llama3.1"];
+
+  if (!currentModel || knownDefaults.includes(currentModel)) {
     modelInput.value = defaultModelForProvider(providerSelect.value);
   }
 
@@ -1232,11 +1383,15 @@ collectionClearBtn.addEventListener("click", resetCollectionRun);
 refreshBtn.addEventListener("click", async () => {
   setBusy(true);
   responseBox.textContent = "Reading page...";
+  setAgentState("Reading page", "active");
+  recordActivity("Read current page", "active");
 
   const result = await readCurrentPage();
 
   if (result.error) {
     responseBox.textContent = result.error;
+    setAgentState("Error", "danger");
+    recordActivity(result.error, "danger");
   } else {
     const count = result.pageData.elements?.length || 0;
     const frameCount = result.pageData.frames?.length || 1;
@@ -1245,6 +1400,8 @@ refreshBtn.addEventListener("click", async () => {
       ? `\nWarnings:\n${result.pageData.warnings.join("\n")}`
       : "";
     responseBox.textContent = `Page read successfully. Found ${count} interactive elements across ${frameCount} frame(s) and ${chunkCount} text chunk(s).${warningText}`;
+    setAgentState("Completed", "success");
+    recordActivity("Extracted main content", "success");
   }
 
   setBusy(false);
@@ -1255,11 +1412,15 @@ askBtn.addEventListener("click", async () => {
 
   if (!task) {
     responseBox.textContent = "Write a task first.";
+    setAgentState("Ready");
+    recordActivity("Waiting for a task");
     return;
   }
 
   setBusy(true);
   responseBox.textContent = "Reading page...";
+  setAgentState("Reading page", "active");
+  recordActivity("Read current page", "active");
   actionsBox.style.display = "none";
   pendingActions = [];
   executedActions = [];
@@ -1270,15 +1431,20 @@ askBtn.addEventListener("click", async () => {
 
   if (result.error) {
     responseBox.textContent = result.error;
+    setAgentState("Error", "danger");
+    recordActivity(result.error, "danger");
     setBusy(false);
     return;
   }
 
   const { tab, pageData } = result;
   responseBox.textContent = "Thinking...";
+  setAgentState("Thinking", "active");
+  recordActivity("Thinking through the request", "active");
 
   if (Array.isArray(pageData.warnings) && pageData.warnings.length) {
     responseBox.textContent = `Context warnings:\n${pageData.warnings.join("\n")}\n\nThinking...`;
+    recordActivity("Context warnings found", "active");
   }
 
   try {
@@ -1293,8 +1459,11 @@ askBtn.addEventListener("click", async () => {
   } catch (error) {
     if (error.name === "AbortError") {
       appendResponse("Stopped.");
+      setAgentState("Completed", "success");
     } else {
       responseBox.textContent = `Could not complete request: ${error.message}. Make sure the backend is running on ${API_BASE}.`;
+      setAgentState("Error", "danger");
+      recordActivity(`Could not complete request: ${error.message}`, "danger");
     }
   } finally {
     activeAbortController = null;
@@ -1311,7 +1480,9 @@ runBatchBtn.addEventListener("click", async () => {
   taskPermissionGranted = true;
   batchRunning = true;
   setBusy(true);
+  setAgentState("Waiting for permission", "active");
   appendResponse("Permission granted once for this task batch. Running actions...");
+  setAgentState("Running browser action", "active");
 
   while (taskPermissionGranted) {
     const nextIndex = pendingActions.findIndex(action => normalizeActionForDisplay(action).riskLabel !== "blocked");
@@ -1329,6 +1500,7 @@ runBatchBtn.addEventListener("click", async () => {
 
     if (result && result.error) {
       appendResponse("Stopped because an action failed.");
+      setAgentState("Error", "danger");
       break;
     }
   }
@@ -1336,6 +1508,10 @@ runBatchBtn.addEventListener("click", async () => {
   batchRunning = false;
   renderActions();
   setBusy(false);
+  if (!pendingActions.length) {
+    setAgentState("Completed", "success");
+    recordActivity("Action batch completed", "success");
+  }
 });
 
 clearBtn.addEventListener("click", () => {
@@ -1344,13 +1520,15 @@ clearBtn.addEventListener("click", () => {
   executedActions = [];
   latestPageData = null;
   taskPermissionGranted = false;
-  responseBox.textContent = "Ready.";
+  responseBox.textContent = "Ready. Ask me to summarize, extract, compare, or take action on this page.";
   actionsBox.textContent = "";
   actionsBox.style.display = "none";
   taskInput.value = "";
   attachedFiles = [];
   renderAttachments();
   renderActions();
+  setAgentState("Ready");
+  recordActivity("Cleared current task");
 });
 
 renderAttachments();

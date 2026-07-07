@@ -18,7 +18,7 @@ const RUNTIME_SECRETS_PATH = path.join(__dirname, ".runtime-secrets.json");
 const LOCAL_CODEX_CLI_PATH = path.join(__dirname, "node_modules", "@openai", "codex", "bin", "codex.js");
 
 const PORT = Number(process.env.PORT || 3000);
-const PROVIDERS = new Set(["openai_api_key", "claude_api_key", "openai_signin_codex"]);
+const PROVIDERS = new Set(["openai_api_key", "claude_api_key", "openai_signin_codex", "local_model"]);
 const ACTION_TYPES = new Set(["click", "type", "submit", "extract"]);
 const COLLECTION_ACTION_TYPES = new Set([
   "scroll",
@@ -302,8 +302,11 @@ function getEffectiveSettings(requestedProvider) {
     provider,
     openaiApiKey: localSecrets.openaiApiKey || process.env.OPENAI_API_KEY || "",
     anthropicApiKey: localSecrets.anthropicApiKey || process.env.ANTHROPIC_API_KEY || "",
+    localModelApiKey: localSecrets.localModelApiKey || process.env.LOCAL_MODEL_API_KEY || "ollama",
+    localModelBaseUrl: localSecrets.localModelBaseUrl || process.env.LOCAL_MODEL_BASE_URL || "http://localhost:11434/v1",
     openaiModel: localSecrets.openaiModel || process.env.OPENAI_MODEL || "gpt-5.5",
     anthropicModel: localSecrets.anthropicModel || process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5",
+    localModel: localSecrets.localModel || process.env.LOCAL_MODEL || "llama3.1",
     codexCommand: codexInvocation.command,
     codexBaseArgs: codexInvocation.baseArgs,
     codexCommandLabel: codexInvocation.label,
@@ -1015,6 +1018,32 @@ async function callClaude({ instructions, input, settings, screenshot }) {
   return textBlock?.text || "";
 }
 
+function localModelClient(settings) {
+  if (!settings.localModelBaseUrl) {
+    throw new Error("Missing local model base URL. Set LOCAL_MODEL_BASE_URL in server/.env.");
+  }
+
+  return new OpenAI({
+    apiKey: settings.localModelApiKey || "ollama",
+    baseURL: settings.localModelBaseUrl
+  });
+}
+
+async function callLocalModel({ instructions, input, settings }) {
+  const client = localModelClient(settings);
+
+  const response = await client.chat.completions.create({
+    model: settings.localModel,
+    temperature: 0.2,
+    messages: [
+      { role: "system", content: instructions },
+      { role: "user", content: input }
+    ]
+  });
+
+  return response.choices?.[0]?.message?.content || "";
+}
+
 async function callOpenAISigninCodex({ instructions, input, settings, signal }) {
   const prompt = `${instructions}\n\n${input}\n\nReturn only the JSON object. No markdown.`.slice(0, 30000);
   const outputPath = path.join(__dirname, `.codex-last-message-${process.pid}-${Date.now()}.txt`);
@@ -1047,6 +1076,10 @@ async function callSelectedProvider({ provider, instructions, input, settings, s
 
   if (provider === "openai_signin_codex") {
     return callOpenAISigninCodex({ instructions, input, settings, signal });
+  }
+
+  if (provider === "local_model") {
+    return callLocalModel({ instructions, input, settings });
   }
 
   throw new Error(`Unsupported provider: ${provider}`);
@@ -1133,6 +1166,29 @@ async function* streamClaudeReply({ instructions, input, settings, screenshot, s
     } else if (event.type === "text") {
       yield event.text || "";
     }
+  }
+}
+
+async function* streamLocalModelReply({ instructions, input, settings, signal }) {
+  const client = localModelClient(settings);
+  const stream = await client.chat.completions.create(
+    {
+      model: settings.localModel,
+      temperature: 0.2,
+      stream: true,
+      messages: [
+        { role: "system", content: instructions },
+        { role: "user", content: input }
+      ]
+    },
+    { signal }
+  );
+
+  for await (const chunk of stream) {
+    if (signal?.aborted) throw new Error("Request aborted.");
+
+    const delta = chunk.choices?.[0]?.delta?.content;
+    if (delta) yield delta;
   }
 }
 
@@ -1244,6 +1300,10 @@ async function buildAgentFinalResponse({ body, signal }) {
     warnings.push("Screenshot context is omitted for OpenAI sign-in through Codex CLI mode.");
   }
 
+  if (settings.provider === "local_model" && page.screenshot) {
+    warnings.push("Screenshot context is omitted for local model mode.");
+  }
+
   if (taskIsHighRisk(task)) {
     return {
       reply: "This request appears to involve payment, purchase, financial transfer, crypto, account deletion, or another irreversible action. I can explain what to do, but I will not perform that action automatically.",
@@ -1317,12 +1377,17 @@ app.get("/settings", (req, res) => {
         ? settings.anthropicModel
         : settings.provider === "openai_signin_codex"
           ? settings.codexModel
-          : settings.openaiModel,
+          : settings.provider === "local_model"
+            ? settings.localModel
+            : settings.openaiModel,
     openaiModel: settings.openaiModel,
     anthropicModel: settings.anthropicModel,
+    localModel: settings.localModel,
+    localModelBaseUrl: settings.localModelBaseUrl,
     codexModel: settings.codexModel,
     hasOpenAIKey: Boolean(settings.openaiApiKey),
-    hasClaudeKey: Boolean(settings.anthropicApiKey)
+    hasClaudeKey: Boolean(settings.anthropicApiKey),
+    hasLocalModelKey: Boolean(settings.localModelApiKey)
   });
 });
 
@@ -1355,6 +1420,11 @@ app.post("/settings", (req, res) => {
     if (model) next.codexModel = model;
   }
 
+  if (normalizedProvider === "local_model") {
+    if (apiKey) next.localModelApiKey = apiKey;
+    if (model) next.localModel = model;
+  }
+
   writeRuntimeSecrets(next);
 
   res.json({
@@ -1362,7 +1432,9 @@ app.post("/settings", (req, res) => {
     provider: normalizeProvider(next.provider),
     message: normalizedProvider === "openai_signin_codex"
       ? "Make sure `codex login` has been completed locally."
-      : "API key mode saved locally on the backend."
+      : normalizedProvider === "local_model"
+        ? "Local model mode saved. Set LOCAL_MODEL_BASE_URL in server/.env if needed."
+        : "API key mode saved locally on the backend."
   });
 });
 
@@ -1662,6 +1734,10 @@ app.post("/agent/stream", async (req, res) => {
       warnings.push("Screenshot context is omitted for OpenAI sign-in through Codex CLI mode.");
     }
 
+    if (settings.provider === "local_model" && page.screenshot) {
+      warnings.push("Screenshot context is omitted for local model mode.");
+    }
+
     sendSse(res, "status", { message: "Reading page context..." });
 
     if (taskIsHighRisk(task)) {
@@ -1710,13 +1786,20 @@ app.post("/agent/stream", async (req, res) => {
         screenshot: page.screenshot,
         signal: abortController.signal
       })
-      : streamOpenAIReply({
-        instructions: replyPrompt.instructions,
-        input: replyPrompt.input,
-        settings,
-        screenshot: page.screenshot,
-        signal: abortController.signal
-      });
+      : settings.provider === "local_model"
+        ? streamLocalModelReply({
+          instructions: replyPrompt.instructions,
+          input: replyPrompt.input,
+          settings,
+          signal: abortController.signal
+        })
+        : streamOpenAIReply({
+          instructions: replyPrompt.instructions,
+          input: replyPrompt.input,
+          settings,
+          screenshot: page.screenshot,
+          signal: abortController.signal
+        });
 
     for await (const delta of stream) {
       if (abortController.signal.aborted) throw new Error("Request aborted.");
