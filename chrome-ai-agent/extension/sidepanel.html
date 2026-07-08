@@ -104,8 +104,8 @@
             <div class="policy-item">
               <span class="mini-switch active" aria-hidden="true"></span>
               <span>
-                <strong>Ask permission once per task</strong>
-                <small>Enabled by agent policy</small>
+                <strong>Auto-run non-sensitive actions</strong>
+                <small>Requested actions run after planning</small>
               </span>
             </div>
             <div class="policy-item">
@@ -115,13 +115,6 @@
                 <small>Submit actions require direct instruction</small>
               </span>
             </div>
-            <label class="policy-item policy-checkbox" for="pauseCautionPreview">
-              <input id="pauseCautionPreview" type="checkbox" checked />
-              <span>
-                <strong>Pause after preview for caution actions</strong>
-                <small>Review highlighted typing or submit targets before running</small>
-              </span>
-            </label>
             <button id="permissionInfoBtn" class="ghost-button compact-button" type="button">Permissions &amp; Safety</button>
           </div>
         </div>
@@ -129,46 +122,27 @@
 
       <main class="agent-card activity-card" aria-labelledby="activityHeading">
         <div class="card-title-row">
-          <h2 id="activityHeading">Chat &amp; Activity</h2>
+          <h2 id="activityHeading">Response</h2>
         </div>
 
         <div id="agentStateTitle" class="agent-state" role="status" aria-live="polite">Ready</div>
 
-        <section class="activity-section" aria-label="Agent activity">
-          <h3>Agent Activity</h3>
-          <ol id="activityTimeline" class="activity-timeline">
-            <li class="activity-entry">
-              <span class="activity-node" aria-hidden="true"></span>
-              <span class="activity-time">Now</span>
-              <span>Started new session</span>
-            </li>
-          </ol>
-        </section>
-
         <div id="response" class="box message-panel response-log">Ready. Ask me to summarize, extract, compare, or take action on this page.</div>
-        <div id="actionPausePanel" class="action-pause-panel" style="display:none;" role="group" aria-label="Preview confirmation">
-          <div id="actionPauseText" class="action-pause-copy">Review the highlighted target before continuing.</div>
-          <div class="button-row">
-            <button id="previewContinueBtn" class="primary-button compact-button" type="button">Continue</button>
-            <button id="previewStopBtn" class="ghost-button compact-button" type="button">Stop</button>
-          </div>
-        </div>
         <div id="actions" class="box actions-panel" style="display:none;"></div>
-        <button id="runBatchBtn" class="primary-button run-batch-button" type="button" style="display:none;">Run Batch</button>
 
-        <section class="action-history-section" aria-label="Action history">
-          <div class="history-title-row">
+        <details class="action-history-section" aria-label="Action history" open>
+          <summary class="history-title-row">
             <h3>Action History</h3>
             <div class="history-actions">
               <button id="exportHistoryMdBtn" class="ghost-button compact-button" type="button" disabled>Export .md</button>
               <button id="exportHistoryJsonBtn" class="ghost-button compact-button" type="button" disabled>Export .json</button>
               <button id="clearHistoryBtn" class="ghost-button compact-button" type="button">Clear History</button>
             </div>
-          </div>
+          </summary>
           <ol id="actionHistory" class="action-history-list">
             <li class="history-empty">No actions yet.</li>
           </ol>
-        </section>
+        </details>
       </main>
 
       <section class="composer-card" aria-label="Prompt composer">
@@ -279,10 +253,10 @@
           <button id="permissionOnboardingCloseBtn" class="ghost-button compact-button" type="button">Close</button>
         </div>
         <div class="permission-copy">
-          <p>Chrome AI Agent reads the active page so it can summarize, extract, and run approved browser actions.</p>
+          <p>Chrome AI Agent reads the active page so it can summarize, extract, and run requested non-sensitive browser actions.</p>
           <p><strong>All URLs</strong> lets the side panel work on normal websites. <strong>Debugger</strong> is used briefly to read a bounded accessibility tree, then detached. <strong>Storage</strong> keeps local settings, task drafts, and action history.</p>
           <p>Page context is sent to the local backend and selected provider for your request. API keys and saved history stay local to this browser/backend setup.</p>
-          <p>The agent blocks password, OTP, card, payment, transfer, crypto, account deletion, and destructive actions. Submit actions require explicit instruction and approved batches still run only after user permission.</p>
+          <p>The agent blocks password, OTP, card, payment, transfer, crypto, account deletion, and destructive actions. Non-sensitive requested actions run automatically after planning, and ordinary submit actions require explicit instruction.</p>
         </div>
         <button id="permissionOnboardingAckBtn" class="primary-button" type="button">Got It</button>
       </div>

@@ -18,19 +18,18 @@ A local MVP Chrome extension that opens in the Chrome side panel, reads the curr
 - Supports self-hosted DeepSeek-R1 through Ollama
 - Supports self-hosted gpt-oss-20b through Ollama
 - Supports text file attachments from the side-panel composer
-- Preserves the last task draft, auto-resizes the prompt box, and supports `Ctrl+Enter` / `Cmd+Enter` to ask
+- Preserves the last task draft, auto-resizes the prompt box, sends with `Enter`, and inserts new lines with `Shift+Enter`
 - Shows clearer attachment and screenshot states in the composer
 - Supports playbook-driven Collection Mode for longer website extraction runs
 - Exports collected rows as Markdown
 - Proposes click/type/submit/extract actions
 - Previews click/type/submit targets by scrolling/highlighting the element before execution
-- Can pause after preview for caution actions so the user clicks **Continue** before typing or submitting
+- Automatically runs non-blocked requested actions after planning
 - Retries selector failures after short DOM-settle backoff windows, rereads the page, rematches by label/text/role, and retries once
 - Applies preview, rematch, and retry recovery to Collection Mode click/type actions
 - Shows a clean action history for proposed, blocked, retrying, executed, failed, and stopped actions
 - Exports action history as Markdown or JSON for debugging
 - Shows `safe`, `caution`, and `blocked` risk labels for proposed actions
-- Asks permission once per task/action batch
 - Provides a global **Stop** button for streaming requests, action batches, and collection runs
 - Allows ordinary form submit when the user explicitly asks for submit
 - Blocks password, OTP, card, payment, purchase, transfer, crypto, account deletion, and destructive actions
@@ -179,7 +178,7 @@ Enable **Screenshot** in the composer when you want the current visible tab imag
 
 Use **Stop** to cancel an in-flight streaming request, stop before the next action in a running batch, or request that Collection Mode stop after the current step.
 
-The prompt box auto-resizes as you type. Press `Ctrl+Enter` on Windows/Linux or `Cmd+Enter` on macOS to ask without clicking the button. The side panel preserves the last task draft locally so accidental panel closes do not erase the prompt.
+The prompt box auto-resizes as you type. Press `Enter` to ask without clicking the button, or `Shift+Enter` to insert a new line. The side panel preserves the last task draft locally so accidental panel closes do not erase the prompt.
 
 After the model proposes browser actions, the **Action History** panel shows the lifecycle of each action: proposed, blocked, retrying, executed, failed, or stopped. Use **Export .md** for a readable debugging timeline or **Export .json** for the raw retained history data.
 
@@ -187,7 +186,7 @@ After the model proposes browser actions, the **Action History** panel shows the
 
 Collection Mode is for longer website navigation and extraction workflows. Enter a collection task, optionally provide comma-separated fields, and optionally paste or upload a Markdown playbook with site-specific instructions. The default limits are 250 planning steps, 500 rows, 100 visited URLs, 10 no-progress steps, and 30 minutes.
 
-The run asks permission once when you press **Start Collection**. It then loops through deep page snapshots, backend planning, validated browser actions, and row capture until it finishes, reaches a limit, is blocked by safety validation, or you press **Stop**. By default it pauses after the first captured record so you can review it before continuing.
+When you press **Start Collection**, it loops through deep page snapshots, backend planning, validated browser actions, and row capture until it finishes, reaches a limit, is blocked by safety validation, or you press **Stop**. By default it pauses after the first captured record so you can review it before continuing.
 
 Collection snapshots include accessible frames, chunked text, interactive elements, form values, and accessibility context. If **Screenshot** is enabled, collection steps also include opt-in visible-tab screenshot context for API-key providers.
 
@@ -195,9 +194,9 @@ Collection click/type actions use the same target preview, selector rematch, ret
 
 Use **Download .md** to export the collected rows, warnings, run summary, and source URLs as a Markdown file. Collection Mode is Markdown-first; Excel writing is not implemented in this version.
 
-## Permission behavior
+## Action behavior
 
-The extension shows the proposed action batch with risk labels. The user clicks **Grant Permission and Run Batch** once. After that, the extension runs the validated executable actions without asking again for every individual click/type/submit action.
+The extension automatically runs validated, non-blocked actions after a request finishes planning. It does not ask for an in-app approval before each normal click/type/submit/extract action.
 
 Risk labels:
 
@@ -205,11 +204,11 @@ Risk labels:
 - `caution`: executable action that may change page state, such as typing or ordinary submit.
 - `blocked`: shown with a reason, but not executable.
 
-Before click/type/submit actions run, the extension briefly previews the target by scrolling to it and highlighting it. The side panel has a **Pause after preview for caution actions** setting, enabled by default, that pauses typing and submit-like actions after the preview. Click **Continue** to run the highlighted action or **Stop** to mark the action and the remaining batch as stopped.
+Before click/type/submit actions run, the extension briefly previews the target by scrolling to it and highlighting it. The preview is visual only; non-blocked actions continue automatically. Use **Stop** to stop before the next action and mark remaining executable actions as stopped.
 
 If a selector fails because the page changed or rendered asynchronously, the extension waits through short backoff windows, rereads the page, rematches the target using stable label/text/role evidence, previews the rematched target, and retries the action once. Safety blocks, sensitive fields, disabled controls, and high-risk actions are not retried.
 
-The permission resets when the user starts a new task.
+Chrome may still show install or update permission prompts for extension capabilities such as `<all_urls>`, `debugger`, `tabs`, and `storage`. Those browser-level prompts are separate from in-app task approvals.
 
 ## Permission and privacy onboarding
 
@@ -219,7 +218,7 @@ On first run, the side panel explains why the extension requests broad browser p
 - `debugger` is used briefly to request a bounded accessibility tree from the active tab, then detached.
 - `storage` keeps local settings, the last task draft, provider preferences, and action history.
 
-Page text, accessibility context, selected screenshot context, and attachments are sent to the local backend and the selected provider only when you ask a task. API keys and saved side-panel state stay in the local browser/backend setup. The agent blocks password, OTP, card, payment, purchase, transfer, crypto, account deletion, and destructive actions.
+Page text, accessibility context, selected screenshot context, and attachments are sent to the local backend and the selected provider only when you ask a task. API keys and saved side-panel state stay in the local browser/backend setup. The agent blocks password, OTP, card, payment, purchase, transfer, crypto, account deletion, and destructive actions. Non-sensitive requested actions run automatically after planning.
 
 Open the Provider section and click **Permissions & Safety** to view the onboarding explanation again.
 
@@ -342,7 +341,7 @@ The server tries to recover JSON from the model output. If it happens often, imp
 
 The side panel automatically waits briefly, rereads the page, rematches by label/text/role, previews the rematched target, and retries once for selector-like failures. If the action still fails, export **Action History** as Markdown or JSON and inspect the failed entry, rematch note, selector, frame, and page URL.
 
-### Preview pauses before typing or submitting
+### Stop an auto-running action batch
 
-This is expected when **Pause after preview for caution actions** is enabled. Review the highlighted page target, then click **Continue** to run the action or **Stop** to cancel the action batch or collection run.
+Use **Stop** during an action run to stop before the next action. The current browser action may finish if it is already in progress, and remaining executable actions are marked as stopped in Action History.
 

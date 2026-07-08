@@ -14,28 +14,21 @@ const providerDisclosure = document.getElementById("providerDisclosure");
 const settingsToggleBtn = document.getElementById("settingsToggleBtn");
 const apiKeyToggleBtn = document.getElementById("apiKeyToggleBtn");
 const agentStateTitle = document.getElementById("agentStateTitle");
-const activityTimeline = document.getElementById("activityTimeline");
 const actionHistoryList = document.getElementById("actionHistory");
 const clearHistoryBtn = document.getElementById("clearHistoryBtn");
 const exportHistoryMdBtn = document.getElementById("exportHistoryMdBtn");
 const exportHistoryJsonBtn = document.getElementById("exportHistoryJsonBtn");
-const pauseCautionPreviewInput = document.getElementById("pauseCautionPreview");
 const permissionInfoBtn = document.getElementById("permissionInfoBtn");
 
 const taskInput = document.getElementById("task");
 const askBtn = document.getElementById("askBtn");
 const refreshBtn = document.getElementById("refreshBtn");
-const runBatchBtn = document.getElementById("runBatchBtn");
 const stopBtn = document.getElementById("stopBtn");
 const clearBtn = document.getElementById("clearBtn");
 const attachFileBtn = document.getElementById("attachFileBtn");
 const fileInput = document.getElementById("fileInput");
 const includeScreenshotInput = document.getElementById("includeScreenshot");
 const screenshotToggle = includeScreenshotInput?.closest(".icon-toggle");
-const actionPausePanel = document.getElementById("actionPausePanel");
-const actionPauseText = document.getElementById("actionPauseText");
-const previewContinueBtn = document.getElementById("previewContinueBtn");
-const previewStopBtn = document.getElementById("previewStopBtn");
 const attachmentTray = document.getElementById("attachmentTray");
 const composerState = document.getElementById("composerState");
 const responseBox = document.getElementById("response");
@@ -74,18 +67,16 @@ const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_BYTES = 512 * 1024;
 const MAX_ATTACHMENT_CHARS = 12000;
 const MAX_TOTAL_ATTACHMENT_CHARS = 30000;
-const ACTIVITY_LIMIT = 8;
 const ACTION_HISTORY_LIMIT = 60;
 const ACTION_HISTORY_STORAGE_KEY = "chromeAiAgentActionHistory";
 const TASK_DRAFT_STORAGE_KEY = "chromeAiAgentTaskDraft";
-const PAUSE_CAUTION_PREVIEW_STORAGE_KEY = "chromeAiAgentPauseCautionPreview";
 const ONBOARDING_ACK_STORAGE_KEY = "chromeAiAgentPermissionOnboardingAck";
 const ACTION_RETRY_DELAYS_MS = [300, 700, 1500];
 
 let pendingActions = [];
 let executedActions = [];
 let latestPageData = null;
-let taskPermissionGranted = false;
+let actionRunStopRequested = false;
 let codexSigninPollTimer = null;
 let attachedFiles = [];
 let nextAttachmentId = 1;
@@ -96,15 +87,12 @@ let batchRunning = false;
 let actionHistory = [];
 let runningActionHistoryId = "";
 let lastTaskDraftSaveTimer = null;
-let pauseCautionPreview = true;
-let pendingPreviewPause = null;
 
 function setBusy(isBusy) {
   document.body.classList.toggle("is-busy", isBusy);
   document.body.setAttribute("aria-busy", String(isBusy));
   askBtn.disabled = isBusy;
   refreshBtn.disabled = isBusy;
-  runBatchBtn.disabled = isBusy || !executableActions(pendingActions).length;
   saveSettingsBtn.disabled = isBusy;
   codexLoginBtn.disabled = isBusy;
   codexCheckBtn.disabled = isBusy;
@@ -437,21 +425,6 @@ function downloadActionHistoryJson() {
   );
 }
 
-async function loadUserPreferences() {
-  const data = await storageGet(PAUSE_CAUTION_PREVIEW_STORAGE_KEY);
-  pauseCautionPreview = data[PAUSE_CAUTION_PREVIEW_STORAGE_KEY] !== false;
-
-  if (pauseCautionPreviewInput) {
-    pauseCautionPreviewInput.checked = pauseCautionPreview;
-  }
-}
-
-function setPauseCautionPreview(value) {
-  pauseCautionPreview = Boolean(value);
-  if (pauseCautionPreviewInput) pauseCautionPreviewInput.checked = pauseCautionPreview;
-  storageSet({ [PAUSE_CAUTION_PREVIEW_STORAGE_KEY]: pauseCautionPreview });
-}
-
 function showPermissionOnboarding() {
   if (!permissionOnboarding) return;
   permissionOnboarding.hidden = false;
@@ -518,68 +491,14 @@ function setAgentState(label, tone = "") {
   }
 }
 
-function activityTimestamp() {
-  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
-function activityToneFromMessage(message, fallback = "") {
-  const text = String(message || "").toLowerCase();
-
-  if (fallback) return fallback;
-  if (text.includes("error") || text.includes("failed") || text.includes("could not") || text.includes("stopped")) return "danger";
-  if (text.includes("complete") || text.includes("success") || text.includes("saved")) return "success";
-  if (text.includes("reading") || text.includes("thinking") || text.includes("planning") || text.includes("running")) return "active";
-  return "";
-}
-
-function recordActivity(message, tone = "") {
-  if (!activityTimeline) return;
-
-  const clean = String(message || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 160);
-
-  if (!clean) return;
-
-  const lastEntry = activityTimeline.lastElementChild?.querySelector(".activity-message")?.textContent || "";
-  if (lastEntry === clean) return;
-
-  const entry = document.createElement("li");
-  entry.className = `activity-entry ${activityToneFromMessage(clean, tone)}`.trim();
-
-  const node = document.createElement("span");
-  node.className = "activity-node";
-  node.setAttribute("aria-hidden", "true");
-
-  const time = document.createElement("span");
-  time.className = "activity-time";
-  time.textContent = activityTimestamp();
-
-  const copy = document.createElement("span");
-  copy.className = "activity-message";
-  copy.textContent = clean;
-
-  entry.appendChild(node);
-  entry.appendChild(time);
-  entry.appendChild(copy);
-  activityTimeline.appendChild(entry);
-
-  while (activityTimeline.children.length > ACTIVITY_LIMIT) {
-    activityTimeline.firstElementChild?.remove();
-  }
-
-  activityTimeline.scrollTop = activityTimeline.scrollHeight;
-}
+function recordActivity(message, tone = "") {}
 
 function updateAgentStateFromMessage(message) {
   const text = String(message || "").toLowerCase();
 
   if (!text) return;
 
-  if (text.includes("waiting for permission") || text.includes("permission granted")) {
-    setAgentState("Waiting for permission", "active");
-  } else if (text.includes("running action") || text.includes("running actions") || text.includes("action result")) {
+  if (text.includes("auto-running") || text.includes("running action") || text.includes("running actions") || text.includes("action result")) {
     setAgentState("Running browser action", "active");
   } else if (text.includes("reading page") || text.includes("page read")) {
     setAgentState("Reading page", "active");
@@ -1214,11 +1133,7 @@ async function executeCollectionActions(tabId, actions, snapshot) {
       const execution = await executeActionWithPreviewAndRetry(actionWithHistory, {
         collection: true,
         originalPageData: snapshot,
-        shouldStop: () => collectionRun.stopRequested,
-        onStop: () => {
-          collectionRun.stopRequested = true;
-          setCollectionStatus("Stopping collection after preview...", "danger");
-        }
+        shouldStop: () => collectionRun.stopRequested
       });
       const result = execution.result;
       const finalAction = execution.action || actionWithHistory;
@@ -1227,11 +1142,11 @@ async function executeCollectionActions(tabId, actions, snapshot) {
         updateActionHistoryEntry(historyId, {
           status: "stopped",
           attempts: execution.attempts || 1,
-          result: result?.result || "Stopped after preview.",
+          result: result?.result || "Stopped.",
           error: "",
           rematchNote: execution.rematchNote || ""
         });
-        addCollectionLog(result?.result || "Stopped after preview.");
+        addCollectionLog(result?.result || "Stopped.");
         renderCollectionRun();
         return false;
       }
@@ -1493,23 +1408,18 @@ function stopCurrentWork() {
     activeAbortController = null;
   }
 
-  if (pendingPreviewPause) {
-    resolvePreviewPause(false);
-  }
-
   if (collectionRun.running) {
     collectionRun.stopRequested = true;
     setCollectionStatus("Stopping after the current step...");
   }
 
-  if (batchRunning || taskPermissionGranted) {
-    taskPermissionGranted = false;
-    batchRunning = false;
-    stopPendingActionHistory();
-    appendResponse("Stopping current action batch...");
+  if (batchRunning) {
+    actionRunStopRequested = true;
+    stopPendingActionHistory("Stopped by user before this action ran.");
+    appendResponse("Stopping current action run after the current step...");
   }
 
-  setBusy(false);
+  if (!batchRunning) setBusy(false);
   renderCollectionRun();
   renderActions();
 }
@@ -1518,7 +1428,6 @@ function renderActions() {
   if (!pendingActions.length) {
     actionsBox.style.display = "none";
     actionsBox.textContent = "";
-    runBatchBtn.style.display = "none";
     return;
   }
 
@@ -1580,11 +1489,6 @@ function renderActions() {
     actionsBox.appendChild(div);
   });
 
-  runBatchBtn.style.display = "inline-block";
-  runBatchBtn.disabled = !runnableCount || batchRunning;
-  runBatchBtn.textContent = runnableCount
-    ? `Grant Permission and Run Batch (${runnableCount})`
-    : "No Runnable Actions";
 }
 
 async function getActiveTab() {
@@ -1660,64 +1564,6 @@ async function runPageAction(action, options = {}) {
 
 function resultError(result) {
   return result?.error ? String(result.error) : "";
-}
-
-function actionRequiresPreviewPause(action) {
-  const type = String(action?.type || "").toLowerCase();
-  return pauseCautionPreview &&
-    actionNeedsPreview(action) &&
-    (actionRiskLabel(action) === "caution" || type === "type" || type === "submit");
-}
-
-function setActionPausePanelVisible(isVisible) {
-  if (!actionPausePanel) return;
-  actionPausePanel.style.display = isVisible ? "grid" : "none";
-}
-
-function resolvePreviewPause(shouldContinue) {
-  if (!pendingPreviewPause) return;
-
-  const pending = pendingPreviewPause;
-  pendingPreviewPause = null;
-  setActionPausePanelVisible(false);
-
-  if (!shouldContinue) {
-    pending.onStop?.();
-  }
-
-  pending.resolve(Boolean(shouldContinue));
-}
-
-function waitForPreviewApproval(action, options = {}) {
-  if (!actionRequiresPreviewPause(action)) {
-    return Promise.resolve(true);
-  }
-
-  if (!actionPausePanel || !previewContinueBtn || !previewStopBtn) {
-    return Promise.resolve(true);
-  }
-
-  if (pendingPreviewPause) {
-    resolvePreviewPause(false);
-  }
-
-  if (actionPauseText) {
-    actionPauseText.textContent = `Review the highlighted target for "${actionSummary(action)}" before continuing.`;
-  }
-
-  setActionPausePanelVisible(true);
-  previewContinueBtn.disabled = false;
-  previewStopBtn.disabled = false;
-  setAgentState("Waiting for preview approval", "active");
-  recordActivity("Paused after preview for approval", "active");
-  previewContinueBtn.focus();
-
-  return new Promise(resolve => {
-    pendingPreviewPause = {
-      resolve,
-      onStop: options.onStop
-    };
-  });
 }
 
 async function retryActionAfterRefresh(action, historyId, originalError, originalPageData, options = {}) {
@@ -1829,19 +1675,6 @@ async function retryActionAfterRefresh(action, historyId, originalError, origina
       continue;
     }
 
-    const approved = await waitForPreviewApproval(retryAction, options);
-
-    if (!approved) {
-      return {
-        action: retryAction,
-        result: { stopped: true, result: "Stopped after preview." },
-        attempts: 2,
-        retried: true,
-        stopped: true,
-        rematchNote
-      };
-    }
-
     const result = await runPageAction(retryAction, options);
 
     return {
@@ -1882,18 +1715,6 @@ async function executeActionWithPreviewAndRetry(action, options = {}) {
     return retryActionAfterRefresh(action, historyId, previewError, originalPageData, options);
   }
 
-  const approved = await waitForPreviewApproval(action, options);
-
-  if (!approved) {
-    return {
-      action,
-      result: { stopped: true, result: "Stopped after preview." },
-      attempts: 1,
-      retried: false,
-      stopped: true
-    };
-  }
-
   if (options.shouldStop?.()) {
     return {
       action,
@@ -1920,13 +1741,24 @@ async function executeActionWithPreviewAndRetry(action, options = {}) {
 }
 
 function stopPendingActionHistory(reason = "Stopped before this action ran.") {
-  for (const action of executableActions(pendingActions)) {
-    updateActionHistoryEntry(action.historyId, {
+  const remainingActions = [];
+
+  for (const action of pendingActions) {
+    const normalized = normalizeActionForDisplay(action);
+
+    if (normalized.riskLabel === "blocked") {
+      remainingActions.push(action);
+      continue;
+    }
+
+    updateActionHistoryEntry(normalized.historyId, {
       status: "stopped",
       result: reason,
       error: ""
     });
   }
+
+  pendingActions = remainingActions;
 }
 
 async function postJson(url, body) {
@@ -2066,8 +1898,11 @@ async function streamAgentRequest(payload) {
       } else if (event === "final") {
         sawFinal = true;
         applyAgentFinal(data);
-        setAgentState("Completed", "success");
-        recordActivity("Response completed", "success");
+        const ranActions = await autoRunExecutableActions();
+        if (!ranActions) {
+          setAgentState("Completed", "success");
+          recordActivity("Response completed", "success");
+        }
       } else if (event === "error") {
         setAgentState("Error", "danger");
         recordActivity(data.error || data.message || "Streaming request failed", "danger");
@@ -2339,27 +2174,30 @@ taskInput.addEventListener("input", () => {
 });
 
 taskInput.addEventListener("keydown", event => {
-  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-    event.preventDefault();
-    if (!askBtn.disabled) askBtn.click();
-  }
+  if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+
+  event.preventDefault();
+  if (!askBtn.disabled) askBtn.click();
 });
 
 if (clearHistoryBtn) {
-  clearHistoryBtn.addEventListener("click", clearActionHistory);
+  clearHistoryBtn.addEventListener("click", event => {
+    event.preventDefault();
+    clearActionHistory();
+  });
 }
 
 if (exportHistoryMdBtn) {
-  exportHistoryMdBtn.addEventListener("click", downloadActionHistoryMarkdown);
+  exportHistoryMdBtn.addEventListener("click", event => {
+    event.preventDefault();
+    downloadActionHistoryMarkdown();
+  });
 }
 
 if (exportHistoryJsonBtn) {
-  exportHistoryJsonBtn.addEventListener("click", downloadActionHistoryJson);
-}
-
-if (pauseCautionPreviewInput) {
-  pauseCautionPreviewInput.addEventListener("change", () => {
-    setPauseCautionPreview(pauseCautionPreviewInput.checked);
+  exportHistoryJsonBtn.addEventListener("click", event => {
+    event.preventDefault();
+    downloadActionHistoryJson();
   });
 }
 
@@ -2373,14 +2211,6 @@ if (permissionOnboardingCloseBtn) {
 
 if (permissionOnboardingAckBtn) {
   permissionOnboardingAckBtn.addEventListener("click", () => hidePermissionOnboarding({ acknowledge: true }));
-}
-
-if (previewContinueBtn) {
-  previewContinueBtn.addEventListener("click", () => resolvePreviewPause(true));
-}
-
-if (previewStopBtn) {
-  previewStopBtn.addEventListener("click", () => resolvePreviewPause(false));
 }
 
 collectionPlaybookBtn.addEventListener("click", () => {
@@ -2431,7 +2261,6 @@ collectionStartBtn.addEventListener("click", async () => {
 
 collectionStopBtn.addEventListener("click", () => {
   collectionRun.stopRequested = true;
-  if (pendingPreviewPause) resolvePreviewPause(false);
   setCollectionStatus("Stopping after the current step...");
   renderCollectionRun();
 });
@@ -2499,7 +2328,7 @@ askBtn.addEventListener("click", async () => {
   actionsBox.style.display = "none";
   pendingActions = [];
   executedActions = [];
-  taskPermissionGranted = false;
+  actionRunStopRequested = false;
   renderActions();
 
   const result = await readCurrentPage();
@@ -2546,20 +2375,23 @@ askBtn.addEventListener("click", async () => {
   }
 });
 
-runBatchBtn.addEventListener("click", async () => {
+async function autoRunExecutableActions() {
   if (!executableActions(pendingActions).length) {
     renderActions();
-    return;
+    return false;
   }
 
-  taskPermissionGranted = true;
+  if (batchRunning) return false;
+
+  actionRunStopRequested = false;
   batchRunning = true;
   setBusy(true);
-  setAgentState("Waiting for permission", "active");
-  appendResponse("Permission granted once for this task batch. Running actions...");
+  const runnableCount = executableActions(pendingActions).length;
+  appendResponse(`Auto-running ${runnableCount} non-blocked action${runnableCount === 1 ? "" : "s"}...`);
   setAgentState("Running browser action", "active");
+  let runFailed = false;
 
-  while (taskPermissionGranted) {
+  while (!actionRunStopRequested) {
     const nextIndex = pendingActions.findIndex(action => normalizeActionForDisplay(action).riskLabel !== "blocked");
     if (nextIndex === -1) break;
 
@@ -2571,11 +2403,7 @@ runBatchBtn.addEventListener("click", async () => {
     });
 
     const execution = await executeActionWithPreviewAndRetry(action, {
-      shouldStop: () => !taskPermissionGranted || !batchRunning,
-      onStop: () => {
-        taskPermissionGranted = false;
-        batchRunning = false;
-      }
+      shouldStop: () => actionRunStopRequested || !batchRunning
     });
     const result = execution.result;
     const finalAction = execution.action || action;
@@ -2586,14 +2414,14 @@ runBatchBtn.addEventListener("click", async () => {
       updateActionHistoryEntry(runningActionHistoryId, {
         status: "stopped",
         attempts: execution.attempts || 1,
-        result: result?.result || "Stopped after preview.",
+        result: result?.result || "Stopped.",
         error: "",
         rematchNote: execution.rematchNote || ""
       });
-      appendResponse(result?.result || "Stopped after preview.");
+      appendResponse(result?.result || "Stopped.");
       setAgentState("Completed", "success");
-      taskPermissionGranted = false;
-      stopPendingActionHistory("Stopped after preview approval was declined.");
+      actionRunStopRequested = true;
+      stopPendingActionHistory("Stopped by user before this action ran.");
       break;
     }
 
@@ -2607,7 +2435,8 @@ runBatchBtn.addEventListener("click", async () => {
       });
       appendResponse(`Action failed: ${result.error}`);
       setAgentState("Error", "danger");
-      taskPermissionGranted = false;
+      actionRunStopRequested = true;
+      runFailed = true;
       stopPendingActionHistory("Stopped because a previous action failed.");
       break;
     }
@@ -2624,20 +2453,23 @@ runBatchBtn.addEventListener("click", async () => {
 
   runningActionHistoryId = "";
   batchRunning = false;
+  actionRunStopRequested = false;
   renderActions();
   setBusy(false);
-  if (!pendingActions.length) {
+  if (!runFailed && !executableActions(pendingActions).length) {
     setAgentState("Completed", "success");
     recordActivity("Action batch completed", "success");
   }
-});
+
+  return true;
+}
 
 clearBtn.addEventListener("click", () => {
   stopCurrentWork();
   pendingActions = [];
   executedActions = [];
   latestPageData = null;
-  taskPermissionGranted = false;
+  actionRunStopRequested = false;
   responseBox.textContent = "Ready. Ask me to summarize, extract, compare, or take action on this page.";
   actionsBox.textContent = "";
   actionsBox.style.display = "none";
@@ -2653,7 +2485,6 @@ clearBtn.addEventListener("click", () => {
 
 renderAttachments();
 renderCollectionRun();
-loadUserPreferences();
 loadActionHistory();
 loadTaskDraft();
 loadPermissionOnboarding();
