@@ -17,6 +17,10 @@ const agentStateTitle = document.getElementById("agentStateTitle");
 const activityTimeline = document.getElementById("activityTimeline");
 const actionHistoryList = document.getElementById("actionHistory");
 const clearHistoryBtn = document.getElementById("clearHistoryBtn");
+const exportHistoryMdBtn = document.getElementById("exportHistoryMdBtn");
+const exportHistoryJsonBtn = document.getElementById("exportHistoryJsonBtn");
+const pauseCautionPreviewInput = document.getElementById("pauseCautionPreview");
+const permissionInfoBtn = document.getElementById("permissionInfoBtn");
 
 const taskInput = document.getElementById("task");
 const askBtn = document.getElementById("askBtn");
@@ -28,6 +32,10 @@ const attachFileBtn = document.getElementById("attachFileBtn");
 const fileInput = document.getElementById("fileInput");
 const includeScreenshotInput = document.getElementById("includeScreenshot");
 const screenshotToggle = includeScreenshotInput?.closest(".icon-toggle");
+const actionPausePanel = document.getElementById("actionPausePanel");
+const actionPauseText = document.getElementById("actionPauseText");
+const previewContinueBtn = document.getElementById("previewContinueBtn");
+const previewStopBtn = document.getElementById("previewStopBtn");
 const attachmentTray = document.getElementById("attachmentTray");
 const composerState = document.getElementById("composerState");
 const responseBox = document.getElementById("response");
@@ -57,6 +65,9 @@ const metricUrls = document.getElementById("metricUrls");
 const metricElapsed = document.getElementById("metricElapsed");
 const metricCurrentUrl = document.getElementById("metricCurrentUrl");
 const metricLastAction = document.getElementById("metricLastAction");
+const permissionOnboarding = document.getElementById("permissionOnboarding");
+const permissionOnboardingCloseBtn = document.getElementById("permissionOnboardingCloseBtn");
+const permissionOnboardingAckBtn = document.getElementById("permissionOnboardingAckBtn");
 
 const API_BASE = "http://localhost:3000";
 const MAX_ATTACHMENTS = 5;
@@ -67,6 +78,9 @@ const ACTIVITY_LIMIT = 8;
 const ACTION_HISTORY_LIMIT = 60;
 const ACTION_HISTORY_STORAGE_KEY = "chromeAiAgentActionHistory";
 const TASK_DRAFT_STORAGE_KEY = "chromeAiAgentTaskDraft";
+const PAUSE_CAUTION_PREVIEW_STORAGE_KEY = "chromeAiAgentPauseCautionPreview";
+const ONBOARDING_ACK_STORAGE_KEY = "chromeAiAgentPermissionOnboardingAck";
+const ACTION_RETRY_DELAYS_MS = [300, 700, 1500];
 
 let pendingActions = [];
 let executedActions = [];
@@ -82,6 +96,8 @@ let batchRunning = false;
 let actionHistory = [];
 let runningActionHistoryId = "";
 let lastTaskDraftSaveTimer = null;
+let pauseCautionPreview = true;
+let pendingPreviewPause = null;
 
 function setBusy(isBusy) {
   document.body.classList.toggle("is-busy", isBusy);
@@ -128,6 +144,10 @@ function storageRemove(key) {
   return new Promise(resolve => {
     storage.remove(key, () => resolve());
   });
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function compactText(value, max = 120) {
@@ -195,6 +215,8 @@ function actionMeta(action) {
 }
 
 function renderActionHistory() {
+  if (exportHistoryMdBtn) exportHistoryMdBtn.disabled = !actionHistory.length;
+  if (exportHistoryJsonBtn) exportHistoryJsonBtn.disabled = !actionHistory.length;
   if (!actionHistoryList) return;
 
   actionHistoryList.textContent = "";
@@ -319,6 +341,137 @@ function clearActionHistory() {
   actionHistory = [];
   renderActionHistory();
   storageSet({ [ACTION_HISTORY_STORAGE_KEY]: actionHistory });
+}
+
+function timestampSlug() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function downloadTextFile(filename, content, type = "text/plain;charset=utf-8") {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function actionHistoryStatusSummary() {
+  const summary = actionHistory.reduce((counts, item) => {
+    const status = item.status || "proposed";
+    counts[status] = (counts[status] || 0) + 1;
+    return counts;
+  }, {});
+
+  return ["proposed", "blocked", "retrying", "executed", "failed", "stopped"]
+    .filter(status => summary[status])
+    .map(status => `- ${status}: ${summary[status]}`)
+    .join("\n") || "- None";
+}
+
+function actionHistoryMarkdown() {
+  const rows = actionHistory.map(item => {
+    const result = item.error
+      ? `Error: ${item.error}`
+      : item.result || "";
+    return `| ${markdownEscape(item.timestamp)} | ${markdownEscape(item.status || "proposed")} | ${markdownEscape(item.scope || "task")} | ${markdownEscape(item.summary)} | ${markdownEscape(item.attempts || 0)} | ${markdownEscape(result)} | ${markdownEscape(item.url)} |`;
+  });
+  const details = actionHistory.map((item, index) => [
+    `### ${index + 1}. ${item.summary || "Action"}`,
+    "",
+    `- Status: ${item.status || "proposed"}`,
+    `- Scope: ${item.scope || "task"}`,
+    `- Task: ${item.task || "N/A"}`,
+    `- Page: ${item.title || "N/A"} (${item.url || "N/A"})`,
+    `- Attempts: ${item.attempts || 0}`,
+    `- Risk: ${item.riskLabel || "safe"}${item.riskReasons?.length ? ` - ${item.riskReasons.join(" ")}` : ""}`,
+    `- Selector: ${item.action?.selector || "N/A"}`,
+    `- Frame: ${Number.isFinite(item.action?.frameId) ? item.action.frameId : 0}`,
+    item.rematchNote ? `- Rematch: ${item.rematchNote}` : "",
+    item.result ? `- Result: ${item.result}` : "",
+    item.error ? `- Error: ${item.error}` : ""
+  ].filter(Boolean).join("\n"));
+
+  return [
+    "# Chrome AI Agent Action History",
+    "",
+    `- Generated: ${new Date().toISOString()}`,
+    `- Retained entries: ${actionHistory.length}`,
+    `- Retention limit: ${ACTION_HISTORY_LIMIT}`,
+    "",
+    "## Status Summary",
+    "",
+    actionHistoryStatusSummary(),
+    "",
+    "## Timeline",
+    "",
+    "| Time | Status | Scope | Action | Attempts | Result | URL |",
+    "| --- | --- | --- | --- | --- | --- | --- |",
+    ...(rows.length ? rows : ["| N/A | N/A | N/A | No actions retained | 0 | N/A | N/A |"]),
+    "",
+    "## Details",
+    "",
+    details.join("\n\n") || "No actions retained."
+  ].join("\n");
+}
+
+function downloadActionHistoryMarkdown() {
+  downloadTextFile(
+    `chrome-ai-agent-action-history-${timestampSlug()}.md`,
+    actionHistoryMarkdown(),
+    "text/markdown;charset=utf-8"
+  );
+}
+
+function downloadActionHistoryJson() {
+  downloadTextFile(
+    `chrome-ai-agent-action-history-${timestampSlug()}.json`,
+    JSON.stringify({
+      generatedAt: new Date().toISOString(),
+      entryCount: actionHistory.length,
+      historyLimit: ACTION_HISTORY_LIMIT,
+      entries: actionHistory
+    }, null, 2),
+    "application/json;charset=utf-8"
+  );
+}
+
+async function loadUserPreferences() {
+  const data = await storageGet(PAUSE_CAUTION_PREVIEW_STORAGE_KEY);
+  pauseCautionPreview = data[PAUSE_CAUTION_PREVIEW_STORAGE_KEY] !== false;
+
+  if (pauseCautionPreviewInput) {
+    pauseCautionPreviewInput.checked = pauseCautionPreview;
+  }
+}
+
+function setPauseCautionPreview(value) {
+  pauseCautionPreview = Boolean(value);
+  if (pauseCautionPreviewInput) pauseCautionPreviewInput.checked = pauseCautionPreview;
+  storageSet({ [PAUSE_CAUTION_PREVIEW_STORAGE_KEY]: pauseCautionPreview });
+}
+
+function showPermissionOnboarding() {
+  if (!permissionOnboarding) return;
+  permissionOnboarding.hidden = false;
+  permissionOnboardingAckBtn?.focus();
+}
+
+function hidePermissionOnboarding({ acknowledge = false } = {}) {
+  if (!permissionOnboarding) return;
+  permissionOnboarding.hidden = true;
+
+  if (acknowledge) {
+    storageSet({ [ONBOARDING_ACK_STORAGE_KEY]: true });
+  }
+}
+
+async function loadPermissionOnboarding() {
+  const data = await storageGet(ONBOARDING_ACK_STORAGE_KEY);
+  if (!data[ONBOARDING_ACK_STORAGE_KEY]) {
+    showPermissionOnboarding();
+  }
 }
 
 function appendResponse(text) {
@@ -969,6 +1122,11 @@ async function readCollectionSnapshot() {
 
   if (result.error) return result;
 
+  latestPageData = {
+    tab: result.tab,
+    pageData: result.page
+  };
+
   return {
     tab: result.tab,
     snapshot: {
@@ -1003,28 +1161,151 @@ function limitStopReason(limits) {
   return "";
 }
 
-async function executeCollectionActions(tabId, actions) {
+function collectionActionUsesPreviewRetry(action) {
+  return ["click", "type"].includes(String(action?.type || "").toLowerCase());
+}
+
+function collectionActionForDisplay(action, snapshot) {
+  const normalized = normalizeActionForDisplay(action);
+  const type = String(normalized.type || "").toLowerCase();
+  const riskLabel = normalized.riskLabel === "safe" && type === "type"
+    ? "caution"
+    : normalized.riskLabel;
+
+  return enrichActionForDisplay({
+    ...normalized,
+    riskLabel
+  }, snapshot);
+}
+
+async function executeCollectionActions(tabId, actions, snapshot) {
   for (const action of actions || []) {
     if (collectionRun.stopRequested) return false;
 
-    collectionRun.lastAction = action.type;
-    addCollectionLog(`Action: ${JSON.stringify(action)}`);
+    const collectionAction = collectionActionForDisplay(action, snapshot);
+    const historyId = addActionHistoryEntry(collectionAction, collectionAction.riskLabel === "blocked" ? "blocked" : "proposed", {
+      scope: "collection",
+      task: collectionRun.task,
+      result: "Queued by Collection Mode."
+    });
+    const actionWithHistory = {
+      ...collectionAction,
+      historyId
+    };
+
+    collectionRun.lastAction = actionWithHistory.type;
+    addCollectionLog(`Action: ${JSON.stringify(actionWithHistory)}`);
     renderCollectionRun();
+
+    if (actionWithHistory.riskLabel === "blocked") {
+      const reason = actionWithHistory.riskReasons?.join(" ") || "Collection action was blocked.";
+      collectionRun.warnings.push(reason);
+      addCollectionLog(`Action blocked: ${reason}`);
+      renderCollectionRun();
+      return false;
+    }
+
+    if (collectionActionUsesPreviewRetry(actionWithHistory)) {
+      updateActionHistoryEntry(historyId, {
+        attempts: 1,
+        result: "Previewing collection target before running."
+      });
+
+      const execution = await executeActionWithPreviewAndRetry(actionWithHistory, {
+        collection: true,
+        originalPageData: snapshot,
+        shouldStop: () => collectionRun.stopRequested,
+        onStop: () => {
+          collectionRun.stopRequested = true;
+          setCollectionStatus("Stopping collection after preview...", "danger");
+        }
+      });
+      const result = execution.result;
+      const finalAction = execution.action || actionWithHistory;
+
+      if (execution.stopped || result?.stopped) {
+        updateActionHistoryEntry(historyId, {
+          status: "stopped",
+          attempts: execution.attempts || 1,
+          result: result?.result || "Stopped after preview.",
+          error: "",
+          rematchNote: execution.rematchNote || ""
+        });
+        addCollectionLog(result?.result || "Stopped after preview.");
+        renderCollectionRun();
+        return false;
+      }
+
+      if (result?.error) {
+        updateActionHistoryEntry(historyId, {
+          status: "failed",
+          attempts: execution.attempts || 1,
+          error: result.error,
+          result: "",
+          rematchNote: execution.rematchNote || ""
+        });
+        collectionRun.warnings.push(result.error);
+        addCollectionLog(`Action blocked/failed: ${result.error}`);
+        renderCollectionRun();
+        return false;
+      }
+
+      updateActionHistoryEntry(historyId, {
+        status: "executed",
+        attempts: execution.attempts || 1,
+        result: result?.result || "Action completed.",
+        error: "",
+        rematchNote: execution.rematchNote || "",
+        action: {
+          type: finalAction.type,
+          selector: finalAction.selector || "",
+          text: finalAction.text || "",
+          frameId: Number.isFinite(finalAction.frameId) ? finalAction.frameId : 0,
+          shadowPath: normalizeShadowPath(finalAction.shadowPath)
+        },
+        meta: actionMeta(finalAction)
+      });
+
+      if (execution.retried) {
+        addCollectionLog(`Action rematched and retried: ${actionSummary(finalAction)}`);
+      }
+
+      await sleep(700);
+      continue;
+    }
+
+    updateActionHistoryEntry(historyId, {
+      attempts: 1,
+      result: "Running collection action."
+    });
 
     const result = await sendToBackground({
       type: "RUN_PAGE_ACTION",
-      action,
+      action: actionWithHistory,
       collection: true
     });
 
     if (result?.error) {
+      updateActionHistoryEntry(historyId, {
+        status: "failed",
+        attempts: 1,
+        error: result.error,
+        result: ""
+      });
       collectionRun.warnings.push(result.error);
       addCollectionLog(`Action blocked/failed: ${result.error}`);
       renderCollectionRun();
       return false;
     }
 
-    await new Promise(resolve => setTimeout(resolve, action.type === "wait" ? 100 : 700));
+    updateActionHistoryEntry(historyId, {
+      status: "executed",
+      attempts: 1,
+      result: result?.result || "Action completed.",
+      error: ""
+    });
+
+    await sleep(actionWithHistory.type === "wait" ? 100 : 700);
   }
 
   return true;
@@ -1122,7 +1403,7 @@ async function runCollectionLoop() {
       continue;
     }
 
-    const actionOk = await executeCollectionActions(tab.id, actions);
+    const actionOk = await executeCollectionActions(tab.id, actions, snapshot);
     if (!actionOk && collectionRun.warnings.length) {
       collectionRun.noProgressSteps += 1;
     }
@@ -1210,6 +1491,10 @@ function stopCurrentWork() {
   if (activeAbortController) {
     activeAbortController.abort();
     activeAbortController = null;
+  }
+
+  if (pendingPreviewPause) {
+    resolvePreviewPause(false);
   }
 
   if (collectionRun.running) {
@@ -1365,10 +1650,11 @@ async function previewPageAction(action) {
   });
 }
 
-async function runPageAction(action) {
+async function runPageAction(action, options = {}) {
   return sendToBackground({
     type: "RUN_PAGE_ACTION",
-    action
+    action,
+    collection: Boolean(options.collection)
   });
 }
 
@@ -1376,7 +1662,65 @@ function resultError(result) {
   return result?.error ? String(result.error) : "";
 }
 
-async function retryActionAfterRefresh(action, historyId, originalError, originalPageData) {
+function actionRequiresPreviewPause(action) {
+  const type = String(action?.type || "").toLowerCase();
+  return pauseCautionPreview &&
+    actionNeedsPreview(action) &&
+    (actionRiskLabel(action) === "caution" || type === "type" || type === "submit");
+}
+
+function setActionPausePanelVisible(isVisible) {
+  if (!actionPausePanel) return;
+  actionPausePanel.style.display = isVisible ? "grid" : "none";
+}
+
+function resolvePreviewPause(shouldContinue) {
+  if (!pendingPreviewPause) return;
+
+  const pending = pendingPreviewPause;
+  pendingPreviewPause = null;
+  setActionPausePanelVisible(false);
+
+  if (!shouldContinue) {
+    pending.onStop?.();
+  }
+
+  pending.resolve(Boolean(shouldContinue));
+}
+
+function waitForPreviewApproval(action, options = {}) {
+  if (!actionRequiresPreviewPause(action)) {
+    return Promise.resolve(true);
+  }
+
+  if (!actionPausePanel || !previewContinueBtn || !previewStopBtn) {
+    return Promise.resolve(true);
+  }
+
+  if (pendingPreviewPause) {
+    resolvePreviewPause(false);
+  }
+
+  if (actionPauseText) {
+    actionPauseText.textContent = `Review the highlighted target for "${actionSummary(action)}" before continuing.`;
+  }
+
+  setActionPausePanelVisible(true);
+  previewContinueBtn.disabled = false;
+  previewStopBtn.disabled = false;
+  setAgentState("Waiting for preview approval", "active");
+  recordActivity("Paused after preview for approval", "active");
+  previewContinueBtn.focus();
+
+  return new Promise(resolve => {
+    pendingPreviewPause = {
+      resolve,
+      onStop: options.onStop
+    };
+  });
+}
+
+async function retryActionAfterRefresh(action, historyId, originalError, originalPageData, options = {}) {
   if (!retryableSelectorError(originalError)) {
     return {
       action,
@@ -1386,97 +1730,185 @@ async function retryActionAfterRefresh(action, historyId, originalError, origina
     };
   }
 
-  updateActionHistoryEntry(historyId, {
-    status: "retrying",
-    attempts: 1,
-    error: originalError,
-    result: "Re-reading page to find the target again."
-  });
   recordActivity("Retrying action after selector changed", "active");
 
-  const reread = await readCurrentPage();
-
-  if (reread.error) {
+  if (!originalPageData) {
     return {
       action,
-      result: { error: `${originalError} Retry failed because the page could not be read again: ${reread.error}` },
+      result: { error: `${originalError} Retry unavailable because the original page context is missing.` },
       attempts: 1,
       retried: false
     };
   }
 
-  const rematched = rematchAction(action, originalPageData, reread.pageData);
+  const readPageForRetry = options.readPageForRetry || readCurrentPage;
+  let lastRetryError = "";
 
-  if (!rematched) {
-    return {
-      action,
-      result: { error: `${originalError} Could not confidently rematch the target after re-reading the page.` },
+  for (const delayMs of ACTION_RETRY_DELAYS_MS) {
+    if (options.shouldStop?.()) {
+      return {
+        action,
+        result: { stopped: true, result: "Stopped before retry." },
+        attempts: 1,
+        retried: false,
+        stopped: true
+      };
+    }
+
+    updateActionHistoryEntry(historyId, {
+      status: "retrying",
       attempts: 1,
-      retried: false
-    };
-  }
+      error: originalError,
+      result: `Waiting ${delayMs}ms for page changes before re-reading.`
+    });
 
-  const retryAction = enrichActionForDisplay({
-    ...rematched.action,
-    historyId
-  }, reread.pageData);
-  const rematchNote = `Retried with selector ${compactText(retryAction.selector, 120)}.`;
+    await sleep(delayMs);
 
-  updateActionHistoryEntry(historyId, {
-    status: "retrying",
-    attempts: 2,
-    error: "",
-    result: "Target rematched; trying once more.",
-    rematchNote,
-    action: {
-      type: retryAction.type,
-      selector: retryAction.selector,
-      text: retryAction.text || "",
-      frameId: Number.isFinite(retryAction.frameId) ? retryAction.frameId : 0,
-      shadowPath: normalizeShadowPath(retryAction.shadowPath)
-    },
-    meta: actionMeta(retryAction)
-  });
+    if (options.shouldStop?.()) {
+      return {
+        action,
+        result: { stopped: true, result: "Stopped before retry." },
+        attempts: 1,
+        retried: false,
+        stopped: true
+      };
+    }
 
-  const preview = await previewPageAction(retryAction);
-  const previewError = resultError(preview);
+    const reread = await readPageForRetry();
+    const nextPageData = reread?.pageData || reread?.snapshot || reread?.page;
 
-  if (previewError) {
+    if (reread?.error || !nextPageData) {
+      lastRetryError = reread?.error || "Page reread did not return page data.";
+      continue;
+    }
+
+    const rematched = rematchAction(action, originalPageData, nextPageData);
+
+    if (!rematched) {
+      lastRetryError = "No confident rematch found.";
+      continue;
+    }
+
+    const retryAction = enrichActionForDisplay({
+      ...rematched.action,
+      historyId
+    }, nextPageData);
+    const rematchNote = `Retried after ${delayMs}ms with selector ${compactText(retryAction.selector, 120)}.`;
+
+    updateActionHistoryEntry(historyId, {
+      status: "retrying",
+      attempts: 2,
+      error: "",
+      result: "Target rematched; trying once more.",
+      rematchNote,
+      action: {
+        type: retryAction.type,
+        selector: retryAction.selector,
+        text: retryAction.text || "",
+        frameId: Number.isFinite(retryAction.frameId) ? retryAction.frameId : 0,
+        shadowPath: normalizeShadowPath(retryAction.shadowPath)
+      },
+      meta: actionMeta(retryAction)
+    });
+
+    const preview = await previewPageAction(retryAction);
+    const previewError = resultError(preview);
+
+    if (previewError) {
+      if (!retryableSelectorError(previewError)) {
+        return {
+          action: retryAction,
+          result: { error: `${originalError} Retry preview failed: ${previewError}` },
+          attempts: 2,
+          retried: true,
+          rematchNote
+        };
+      }
+
+      lastRetryError = `Retry preview failed: ${previewError}`;
+      continue;
+    }
+
+    const approved = await waitForPreviewApproval(retryAction, options);
+
+    if (!approved) {
+      return {
+        action: retryAction,
+        result: { stopped: true, result: "Stopped after preview." },
+        attempts: 2,
+        retried: true,
+        stopped: true,
+        rematchNote
+      };
+    }
+
+    const result = await runPageAction(retryAction, options);
+
     return {
       action: retryAction,
-      result: { error: `${originalError} Retry preview failed: ${previewError}` },
+      result,
       attempts: 2,
       retried: true,
       rematchNote
     };
   }
 
-  const result = await runPageAction(retryAction);
-
   return {
-    action: retryAction,
-    result,
-    attempts: 2,
-    retried: true,
-    rematchNote
+    action,
+    result: { error: `${originalError} Could not confidently rematch the target after retry backoff.${lastRetryError ? ` Last retry: ${lastRetryError}` : ""}` },
+    attempts: 1,
+    retried: false
   };
 }
 
-async function executeActionWithPreviewAndRetry(action) {
+async function executeActionWithPreviewAndRetry(action, options = {}) {
   const historyId = action.historyId || "";
-  const originalPageData = latestPageData?.pageData;
+  const originalPageData = options.originalPageData || latestPageData?.pageData;
+
+  if (options.shouldStop?.()) {
+    return {
+      action,
+      result: { stopped: true, result: "Stopped before action." },
+      attempts: 0,
+      retried: false,
+      stopped: true
+    };
+  }
+
   const preview = await previewPageAction(action);
   const previewError = resultError(preview);
 
   if (previewError) {
-    return retryActionAfterRefresh(action, historyId, previewError, originalPageData);
+    return retryActionAfterRefresh(action, historyId, previewError, originalPageData, options);
   }
 
-  const result = await runPageAction(action);
+  const approved = await waitForPreviewApproval(action, options);
+
+  if (!approved) {
+    return {
+      action,
+      result: { stopped: true, result: "Stopped after preview." },
+      attempts: 1,
+      retried: false,
+      stopped: true
+    };
+  }
+
+  if (options.shouldStop?.()) {
+    return {
+      action,
+      result: { stopped: true, result: "Stopped before action." },
+      attempts: 1,
+      retried: false,
+      stopped: true
+    };
+  }
+
+  const result = await runPageAction(action, options);
   const actionError = resultError(result);
 
   if (actionError) {
-    return retryActionAfterRefresh(action, historyId, actionError, originalPageData);
+    return retryActionAfterRefresh(action, historyId, actionError, originalPageData, options);
   }
 
   return {
@@ -1917,6 +2349,40 @@ if (clearHistoryBtn) {
   clearHistoryBtn.addEventListener("click", clearActionHistory);
 }
 
+if (exportHistoryMdBtn) {
+  exportHistoryMdBtn.addEventListener("click", downloadActionHistoryMarkdown);
+}
+
+if (exportHistoryJsonBtn) {
+  exportHistoryJsonBtn.addEventListener("click", downloadActionHistoryJson);
+}
+
+if (pauseCautionPreviewInput) {
+  pauseCautionPreviewInput.addEventListener("change", () => {
+    setPauseCautionPreview(pauseCautionPreviewInput.checked);
+  });
+}
+
+if (permissionInfoBtn) {
+  permissionInfoBtn.addEventListener("click", showPermissionOnboarding);
+}
+
+if (permissionOnboardingCloseBtn) {
+  permissionOnboardingCloseBtn.addEventListener("click", () => hidePermissionOnboarding());
+}
+
+if (permissionOnboardingAckBtn) {
+  permissionOnboardingAckBtn.addEventListener("click", () => hidePermissionOnboarding({ acknowledge: true }));
+}
+
+if (previewContinueBtn) {
+  previewContinueBtn.addEventListener("click", () => resolvePreviewPause(true));
+}
+
+if (previewStopBtn) {
+  previewStopBtn.addEventListener("click", () => resolvePreviewPause(false));
+}
+
 collectionPlaybookBtn.addEventListener("click", () => {
   collectionPlaybookFile.click();
 });
@@ -1965,6 +2431,7 @@ collectionStartBtn.addEventListener("click", async () => {
 
 collectionStopBtn.addEventListener("click", () => {
   collectionRun.stopRequested = true;
+  if (pendingPreviewPause) resolvePreviewPause(false);
   setCollectionStatus("Stopping after the current step...");
   renderCollectionRun();
 });
@@ -2103,11 +2570,32 @@ runBatchBtn.addEventListener("click", async () => {
       result: "Previewing target before running."
     });
 
-    const execution = await executeActionWithPreviewAndRetry(action);
+    const execution = await executeActionWithPreviewAndRetry(action, {
+      shouldStop: () => !taskPermissionGranted || !batchRunning,
+      onStop: () => {
+        taskPermissionGranted = false;
+        batchRunning = false;
+      }
+    });
     const result = execution.result;
     const finalAction = execution.action || action;
 
     executedActions.push({ action: finalAction, result });
+
+    if (execution.stopped || result?.stopped) {
+      updateActionHistoryEntry(runningActionHistoryId, {
+        status: "stopped",
+        attempts: execution.attempts || 1,
+        result: result?.result || "Stopped after preview.",
+        error: "",
+        rematchNote: execution.rematchNote || ""
+      });
+      appendResponse(result?.result || "Stopped after preview.");
+      setAgentState("Completed", "success");
+      taskPermissionGranted = false;
+      stopPendingActionHistory("Stopped after preview approval was declined.");
+      break;
+    }
 
     if (result && result.error) {
       updateActionHistoryEntry(runningActionHistoryId, {
@@ -2165,8 +2653,10 @@ clearBtn.addEventListener("click", () => {
 
 renderAttachments();
 renderCollectionRun();
+loadUserPreferences();
 loadActionHistory();
 loadTaskDraft();
+loadPermissionOnboarding();
 updateComposerState();
 resizeTaskInput();
 loadSettings();

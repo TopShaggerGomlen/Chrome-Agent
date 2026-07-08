@@ -562,6 +562,12 @@ h1 {
   font-size: 11px;
 }
 
+.policy-checkbox input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
 .mini-switch {
   position: relative;
   width: 30px;
@@ -741,6 +747,22 @@ h1 {
   padding: 12px;
 }
 
+.action-pause-panel {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid rgba(255, 191, 102, 0.34);
+  border-radius: 14px;
+  background: rgba(132, 92, 31, 0.18);
+  padding: 11px;
+  color: var(--muted-strong);
+}
+
+.action-pause-copy {
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .action-history-section {
   display: grid;
   gap: 10px;
@@ -759,6 +781,14 @@ h1 {
   color: var(--text);
   font-size: 15px;
   font-weight: 650;
+}
+
+.history-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .compact-button {
@@ -957,6 +987,60 @@ h1 {
 
 .run-batch-button {
   width: 100%;
+}
+
+.modal-backdrop {
+  position: fixed;
+  z-index: 2147483647;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(3, 5, 9, 0.72);
+  padding: 16px;
+}
+
+.modal-backdrop[hidden] {
+  display: none;
+}
+
+.modal-panel {
+  display: grid;
+  gap: 14px;
+  width: min(100%, 430px);
+  max-height: min(90vh, 620px);
+  overflow: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.03)),
+    #151a23;
+  padding: 16px;
+  box-shadow: var(--shadow);
+}
+
+.modal-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.modal-title-row h2 {
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 760;
+}
+
+.permission-copy {
+  display: grid;
+  gap: 10px;
+  color: var(--muted-strong);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.permission-copy strong {
+  color: var(--text);
 }
 
 .composer-card {
