@@ -307,12 +307,3 @@ Chrome shows a debugger permission warning because the extension uses `chrome.de
 
 The server tries to recover JSON from the model output. If it happens often, implement structured outputs for OpenAI mode and stricter JSON repair for Claude/Codex modes.
 
-## Future upgrades
-
-- Add structured outputs with JSON schema for OpenAI mode.
-- Add better JSON repair for Claude/Codex modes.
-- Add unit tests for action validation.
-- Add better selector generation.
-- Add retry logic.
-- Add a visible action history.
-- Add deeper automated browser QA coverage for streaming, screenshots, accessibility extraction, iframes, and shadow DOM.
