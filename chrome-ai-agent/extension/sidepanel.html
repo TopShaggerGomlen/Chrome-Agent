@@ -85,6 +85,11 @@
                 <button id="apiKeyToggleBtn" class="inline-field-button" type="button" aria-label="Show API key">Show</button>
               </span>
             </label>
+
+            <label class="field" for="pairingCode">
+              <span>Backend pairing code</span>
+              <input id="pairingCode" type="password" placeholder="Shown when the local backend starts" autocomplete="off" />
+            </label>
           </div>
 
           <div class="settings-row">
@@ -129,6 +134,7 @@
 
         <div id="response" class="box message-panel response-log">Ready. Ask me to summarize, extract, compare, or take action on this page.</div>
         <div id="actions" class="box actions-panel" style="display:none;"></div>
+        <button id="runBatchBtn" class="primary-button run-batch-button" type="button" style="display:none;">Run action batch</button>
 
         <details class="action-history-section" aria-label="Action history" open>
           <summary class="history-title-row">
@@ -244,6 +250,54 @@
           <div id="collectionLog" class="collection-log">No collection run yet.</div>
         </div>
       </details>
+
+      <details id="workflowDisclosure" class="collection-card">
+        <summary class="collection-summary">
+          <span>Workflow Mode</span>
+          <span class="toggle-switch" aria-hidden="true"></span>
+        </summary>
+
+        <div class="collection-panel">
+          <div class="section-heading">
+            <div>
+              <h2>Structured workflow</h2>
+              <p>Run a resumable, evidence-backed record workflow.</p>
+            </div>
+            <button id="workflowDeleteBtn" class="ghost-button" type="button" disabled>Delete Run</button>
+          </div>
+
+          <div class="form-grid">
+            <label class="field" for="workflowProfile">
+              <span>Workflow profile</span>
+              <select id="workflowProfile">
+                <option value="urolithiasis-v3">Urolithiasis clinical extraction</option>
+              </select>
+            </label>
+
+            <label class="field" for="workflowQueue">
+              <span>Patient queue</span>
+              <textarea id="workflowQueue" class="collection-playbook" placeholder="MRN,YYYY-MM-DD[,externalId]&#10;One patient per line"></textarea>
+            </label>
+
+            <label class="checkbox-line" for="workflowCloudConsent">
+              <input id="workflowCloudConsent" type="checkbox" />
+              <span>Save approval for this workflow/provider to send minimized, de-identified evidence to the selected cloud provider.</span>
+            </label>
+
+            <div class="button-row collection-actions">
+              <button id="workflowStartBtn" class="primary-button" type="button">Run First Patient</button>
+              <button id="workflowStopBtn" class="ghost-button" type="button" disabled>Stop</button>
+              <button id="workflowContinueBtn" class="ghost-button" type="button" style="display:none;">Approve &amp; Continue</button>
+              <button id="workflowCsvBtn" class="ghost-button" type="button" disabled>Download CSV</button>
+              <button id="workflowMdBtn" class="ghost-button" type="button" disabled>Download .md</button>
+            </div>
+          </div>
+
+          <div id="workflowStatus" class="status-line">No workflow run yet.</div>
+          <div id="workflowSummary" class="collection-log">Paste a queue to create a local workflow run.</div>
+          <div id="workflowPreview" class="rows-preview" style="display:none;"></div>
+        </div>
+      </details>
     </div>
 
     <div id="permissionOnboarding" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="permissionOnboardingTitle" hidden>
@@ -255,8 +309,8 @@
         <div class="permission-copy">
           <p>Chrome AI Agent reads the active page so it can summarize, extract, and run requested non-sensitive browser actions.</p>
           <p><strong>All URLs</strong> lets the side panel work on normal websites. <strong>Debugger</strong> is used briefly to read a bounded accessibility tree, then detached. <strong>Storage</strong> keeps local settings, task drafts, and action history.</p>
-          <p>Page context is sent to the local backend and selected provider for your request. API keys and saved history stay local to this browser/backend setup.</p>
-          <p>The agent blocks password, OTP, card, payment, transfer, crypto, account deletion, and destructive actions. Non-sensitive requested actions run automatically after planning, and ordinary submit actions require explicit instruction.</p>
+          <p>Page context is sent to the local backend and selected provider for your request. API keys, backend pairing tokens, and saved history stay local to this browser/backend setup.</p>
+          <p>The agent blocks password, OTP, card, payment, transfer, crypto, account deletion, and destructive actions. Normal action batches require one explicit approval; sensitive workflows minimize cloud context and require saved provider consent.</p>
         </div>
         <button id="permissionOnboardingAckBtn" class="primary-button" type="button">Got It</button>
       </div>

@@ -4,6 +4,41 @@ const MAX_CHUNK_CHARS = 1800;
 const MAX_ELEMENTS = 220;
 const MAX_FORM_VALUES = 160;
 const MAX_SHADOW_DEPTH = 5;
+const MAX_SNAPSHOT_ROOTS = 24;
+const MAX_SHADOW_HOSTS_PER_ROOT = 80;
+const MAX_ACTION_AGE_MS = 2 * 60 * 1000;
+
+// These are hard ceilings, even when a caller asks for a larger snapshot. Keep
+// the default page context compatible with the existing planner while giving
+// workflow callers a cheaper, targeted alternative.
+const SNAPSHOT_LIMITS = Object.freeze({
+  full: Object.freeze({
+    textChars: MAX_TEXT_CHARS,
+    chunks: MAX_CHUNKS,
+    chunkChars: MAX_CHUNK_CHARS,
+    elements: MAX_ELEMENTS,
+    formValues: MAX_FORM_VALUES
+  }),
+  light: Object.freeze({
+    textChars: 8000,
+    chunks: 10,
+    chunkChars: 900,
+    elements: 80,
+    formValues: 40
+  }),
+  targeted: Object.freeze({
+    textChars: 6000,
+    chunks: 8,
+    chunkChars: 700,
+    elements: 50,
+    formValues: 25
+  })
+});
+
+const DOCUMENT_INSTANCE_ID = typeof globalThis.crypto?.randomUUID === "function"
+  ? globalThis.crypto.randomUUID()
+  : `doc-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+const DOCUMENT_CREATED_AT = new Date().toISOString();
 
 const INTERACTIVE_SELECTOR = [
   "a[href]",
@@ -81,6 +116,84 @@ function cleanText(value, max = 180) {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, max);
+}
+
+function clampSnapshotLimit(value, fallback, hardMaximum) {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.min(Math.floor(value), hardMaximum));
+}
+
+function normalizeSnapshotOptions(options = {}) {
+  const requestedMode = String(options.snapshotMode || options.mode || "full").toLowerCase();
+  const snapshotMode = Object.prototype.hasOwnProperty.call(SNAPSHOT_LIMITS, requestedMode)
+    ? requestedMode
+    : "full";
+  const defaults = SNAPSHOT_LIMITS[snapshotMode];
+  const full = SNAPSHOT_LIMITS.full;
+  const requestedSelectors = Array.isArray(options.targetSelectors)
+    ? options.targetSelectors
+    : Array.isArray(options.selectors)
+      ? options.selectors
+      : [];
+
+  return {
+    snapshotMode,
+    textChars: clampSnapshotLimit(options.textChars, defaults.textChars, full.textChars),
+    chunks: clampSnapshotLimit(options.chunks, defaults.chunks, full.chunks),
+    chunkChars: clampSnapshotLimit(options.chunkChars, defaults.chunkChars, full.chunkChars),
+    elements: clampSnapshotLimit(options.elements, defaults.elements, full.elements),
+    formValues: clampSnapshotLimit(options.formValues, defaults.formValues, full.formValues),
+    targetSelectors: requestedSelectors.slice(0, 12)
+  };
+}
+
+function normalizedDocumentUrl(value = location.href) {
+  try {
+    const url = new URL(value, location.href);
+    // Fragments commonly change as a user scrolls or opens an in-page panel;
+    // they do not indicate a different browser document.
+    url.hash = "";
+    return url.href;
+  } catch (error) {
+    return String(value || "");
+  }
+}
+
+function getDocumentIdentity() {
+  return {
+    id: DOCUMENT_INSTANCE_ID,
+    href: normalizedDocumentUrl(),
+    origin: location.origin,
+    createdAt: DOCUMENT_CREATED_AT
+  };
+}
+
+function targetFingerprintPayload(el, root = document, selector = "", shadowPath = []) {
+  return [
+    "v1",
+    selector,
+    ...(shadowPath || []),
+    el?.tagName?.toLowerCase() || "",
+    el?.getAttribute?.("type") || "",
+    el?.getAttribute?.("role") || "",
+    el?.getAttribute?.("name") || "",
+    el?.getAttribute?.("aria-label") || "",
+    getAssociatedLabel(el, root),
+    getElementText(el, root)
+  ].map(value => cleanText(value, 180).toLowerCase()).join("\u001f");
+}
+
+function hashFingerprint(value) {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `v1-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+function getTargetFingerprint(el, root = document, selector = "", shadowPath = []) {
+  return hashFingerprint(targetFingerprintPayload(el, root, selector, shadowPath));
 }
 
 function isVisible(el) {
@@ -262,16 +375,25 @@ function shadowHostsInRoot(root) {
   return queryAllInRoot(root, "*").filter(el => el.shadowRoot);
 }
 
-function walkRoots(callback, root = document, shadowPath = [], depth = 0) {
+function walkRoots(
+  callback,
+  root = document,
+  shadowPath = [],
+  depth = 0,
+  state = { visitedRoots: 0, maxRoots: MAX_SNAPSHOT_ROOTS }
+) {
+  if (state.visitedRoots >= state.maxRoots) return;
+  state.visitedRoots += 1;
   callback(root, shadowPath);
 
   if (depth >= MAX_SHADOW_DEPTH) return;
 
-  for (const host of shadowHostsInRoot(root)) {
+  for (const host of shadowHostsInRoot(root).slice(0, MAX_SHADOW_HOSTS_PER_ROOT)) {
+    if (state.visitedRoots >= state.maxRoots) break;
     const hostSelector = buildSelectorInRoot(host, root);
     if (!hostSelector) continue;
 
-    walkRoots(callback, host.shadowRoot, [...shadowPath, hostSelector], depth + 1);
+    walkRoots(callback, host.shadowRoot, [...shadowPath, hostSelector], depth + 1, state);
   }
 }
 
@@ -312,16 +434,129 @@ function resolveActionElement(action) {
   }
 }
 
-function collectInteractiveElements() {
-  const elements = [];
+function resolveSnapshotTargets(options) {
+  const targets = [];
   const seen = new Set();
 
+  for (const requestedTarget of options.targetSelectors || []) {
+    const action = typeof requestedTarget === "string"
+      ? { selector: requestedTarget }
+      : requestedTarget;
+    const resolved = resolveActionElement(action || {});
+
+    if (!resolved.error && resolved.el && !seen.has(resolved.el)) {
+      seen.add(resolved.el);
+      targets.push(resolved.el);
+    }
+  }
+
+  return targets;
+}
+
+function isTargetRelevant(el, targetElements) {
+  return !targetElements.length || targetElements.some(target =>
+    target === el || target.contains(el) || el.contains(target)
+  );
+}
+
+function expectedDocumentIdentity(action) {
+  return action?.expectedDocumentIdentity || action?.documentIdentity || action?.context?.documentIdentity;
+}
+
+function documentIdentityMatches(expected) {
+  if (!expected) return true;
+
+  const actual = getDocumentIdentity();
+  if (typeof expected === "string") return expected === actual.id;
+  if (typeof expected !== "object") return false;
+
+  const expectedId = expected.id || expected.documentId || expected.instanceId;
+  const expectedHref = expected.href || expected.url || expected.documentUrl;
+
+  if (expectedId && expectedId !== actual.id) return false;
+  if (expectedHref && normalizedDocumentUrl(expectedHref) !== actual.href) return false;
+
+  return Boolean(expectedId || expectedHref);
+}
+
+function actionTimestamp(action) {
+  const candidate = action?.expiresAt || action?.plannedAt || action?.createdAt || action?.context?.timestamp;
+  if (!candidate) return null;
+  const timestamp = Date.parse(candidate);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function verifyActionFreshness(action) {
+  const expectedIdentity = expectedDocumentIdentity(action);
+  if (expectedIdentity && !documentIdentityMatches(expectedIdentity)) {
+    return { error: "Action is stale: the page document changed after planning. Re-observe and re-plan." };
+  }
+
+  if (action?.expectedUrl && normalizedDocumentUrl(action.expectedUrl) !== normalizedDocumentUrl()) {
+    return { error: "Action is stale: the page URL changed after planning. Re-observe and re-plan." };
+  }
+
+  const timestamp = actionTimestamp(action);
+  if (timestamp) {
+    const expiry = action?.expiresAt ? timestamp : timestamp + MAX_ACTION_AGE_MS;
+    if (Date.now() > expiry) {
+      return { error: "Action is stale: its planning context expired. Re-observe and re-plan." };
+    }
+  }
+
+  return null;
+}
+
+function matchesTargetMetadata(expected, el, root) {
+  if (!expected || typeof expected !== "object") return true;
+
+  const actual = {
+    tag: el.tagName.toLowerCase(),
+    role: el.getAttribute("role") || "",
+    type: el.getAttribute("type") || "",
+    name: el.getAttribute("name") || "",
+    ariaLabel: el.getAttribute("aria-label") || "",
+    label: getAssociatedLabel(el, root),
+    text: getElementText(el, root)
+  };
+
+  return ["tag", "role", "type", "name", "ariaLabel", "label", "text"].every(key => {
+    if (expected[key] === undefined || expected[key] === null || expected[key] === "") return true;
+    return cleanText(actual[key], 180).toLowerCase() === cleanText(expected[key], 180).toLowerCase();
+  });
+}
+
+function verifyActionTargetFreshness(action, el, root) {
+  const expectedFingerprint = action?.targetFingerprint || action?.expectedTargetFingerprint ||
+    action?.target?.fingerprint || action?.expectedTarget?.fingerprint;
+
+  if (expectedFingerprint) {
+    const actualFingerprint = getTargetFingerprint(el, root, action.selector, action.shadowPath || []);
+    if (expectedFingerprint !== actualFingerprint) {
+      return { error: "Action target changed after planning. Re-observe and re-plan before acting." };
+    }
+  }
+
+  const expectedTarget = action?.expectedTarget || action?.targetMetadata ||
+    (action?.target && typeof action.target === "object" ? action.target : null);
+  if (!matchesTargetMetadata(expectedTarget, el, root)) {
+    return { error: "Action target no longer matches the planned control. Re-observe and re-plan before acting." };
+  }
+
+  return null;
+}
+
+function collectInteractiveElements(options = normalizeSnapshotOptions()) {
+  const elements = [];
+  const seen = new Set();
+  const targetElements = resolveSnapshotTargets(options);
+
   walkRoots((root, shadowPath) => {
-    if (elements.length >= MAX_ELEMENTS) return;
+    if (elements.length >= options.elements) return;
 
     for (const el of queryAllInRoot(root, INTERACTIVE_SELECTOR)) {
-      if (elements.length >= MAX_ELEMENTS) break;
-      if (seen.has(el) || !isVisible(el)) continue;
+      if (elements.length >= options.elements) break;
+      if (seen.has(el) || !isVisible(el) || !isTargetRelevant(el, targetElements)) continue;
 
       seen.add(el);
 
@@ -342,7 +577,8 @@ function collectInteractiveElements() {
         name: cleanText(el.getAttribute("name")),
         ariaLabel: cleanText(el.getAttribute("aria-label")),
         disabled: Boolean(el.disabled || el.getAttribute("aria-disabled") === "true"),
-        sensitive: isSensitiveElement(el, root)
+        sensitive: isSensitiveElement(el, root),
+        targetFingerprint: getTargetFingerprint(el, root, selector, shadowPath)
       });
     }
   });
@@ -350,15 +586,16 @@ function collectInteractiveElements() {
   return elements;
 }
 
-function collectFormValues() {
+function collectFormValues(options = normalizeSnapshotOptions()) {
   const values = [];
+  const targetElements = resolveSnapshotTargets(options);
 
   walkRoots((root, shadowPath) => {
-    if (values.length >= MAX_FORM_VALUES) return;
+    if (values.length >= options.formValues) return;
 
     for (const el of queryAllInRoot(root, FORM_SELECTOR)) {
-      if (values.length >= MAX_FORM_VALUES) break;
-      if (!isVisible(el) || isSensitiveElement(el, root)) continue;
+      if (values.length >= options.formValues) break;
+      if (!isVisible(el) || isSensitiveElement(el, root) || !isTargetRelevant(el, targetElements)) continue;
 
       const selector = buildSelectorInRoot(el, root);
       if (!selector) continue;
@@ -377,7 +614,8 @@ function collectFormValues() {
         label: getAssociatedLabel(el, root),
         name: cleanText(el.getAttribute("name")),
         placeholder: cleanText(el.getAttribute("placeholder")),
-        value
+        value,
+        targetFingerprint: getTargetFingerprint(el, root, selector, shadowPath)
       });
     }
   });
@@ -400,14 +638,16 @@ function nearestHeadingText(node) {
   return cleanText(document.title || location.hostname, 120);
 }
 
-function appendTextChunk(chunks, state, text, meta) {
+function appendTextChunk(chunks, state, text, meta, options = normalizeSnapshotOptions()) {
   if (!text) return;
 
-  if (state.current && state.current.text.length + text.length + 1 > MAX_CHUNK_CHARS) {
+  if (state.current && state.current.text.length + text.length + 1 > options.chunkChars) {
     chunks.push(state.current);
     state.totalChars += state.current.text.length;
     state.current = null;
   }
+
+  if (chunks.length >= options.chunks || state.totalChars >= options.textChars) return;
 
   if (!state.current) {
     state.current = {
@@ -420,10 +660,43 @@ function appendTextChunk(chunks, state, text, meta) {
     };
   }
 
-  state.current.text = `${state.current.text}${state.current.text ? "\n" : ""}${text}`.slice(0, MAX_CHUNK_CHARS);
+  const separator = state.current.text ? "\n" : "";
+  const remainingChars = options.textChars - state.totalChars - state.current.text.length - separator.length;
+  if (remainingChars <= 0) return;
+
+  state.current.text = `${state.current.text}${separator}${text.slice(0, remainingChars)}`.slice(0, options.chunkChars);
 }
 
-function collectTextChunks() {
+function collectTargetedTextChunks(targetElements, options) {
+  const chunks = [];
+  let totalChars = 0;
+
+  for (const target of targetElements) {
+    if (chunks.length >= options.chunks || totalChars >= options.textChars || !isVisible(target)) break;
+
+    const text = cleanText(target.innerText || target.textContent, Math.min(options.chunkChars, options.textChars - totalChars));
+    if (!text) continue;
+
+    chunks.push({
+      chunkId: `chunk-${chunks.length + 1}`,
+      heading: nearestHeadingText(target),
+      source: target.getRootNode() instanceof ShadowRoot ? "open-shadow" : "dom",
+      shadowPath: [],
+      visibility: "visible",
+      text
+    });
+    totalChars += text.length;
+  }
+
+  return chunks;
+}
+
+function collectTextChunks(options = normalizeSnapshotOptions()) {
+  const targetElements = resolveSnapshotTargets(options);
+  if (options.snapshotMode === "targeted" && targetElements.length) {
+    return collectTargetedTextChunks(targetElements, options);
+  }
+
   const chunks = [];
   const state = {
     current: null,
@@ -431,7 +704,7 @@ function collectTextChunks() {
   };
 
   walkRoots((root, shadowPath) => {
-    if (chunks.length >= MAX_CHUNKS || state.totalChars >= MAX_TEXT_CHARS) return;
+    if (chunks.length >= options.chunks || state.totalChars >= options.textChars) return;
 
     const walker = document.createTreeWalker(
       root,
@@ -453,26 +726,26 @@ function collectTextChunks() {
       }
     );
 
-    while (walker.nextNode() && chunks.length < MAX_CHUNKS && state.totalChars < MAX_TEXT_CHARS) {
+    while (walker.nextNode() && chunks.length < options.chunks && state.totalChars < options.textChars) {
       const node = walker.currentNode;
-      const text = cleanText(node.textContent, 900);
+      const text = cleanText(node.textContent, Math.min(900, options.chunkChars));
       appendTextChunk(chunks, state, text, {
         heading: nearestHeadingText(node),
         source: shadowPath.length ? "open-shadow" : "dom",
         shadowPath
-      });
+      }, options);
     }
   });
 
-  if (state.current && chunks.length < MAX_CHUNKS) {
+  if (state.current && chunks.length < options.chunks) {
     chunks.push(state.current);
   }
 
   return chunks.map((chunk, index) => ({ ...chunk, chunkId: `chunk-${index + 1}` }));
 }
 
-function getVisibleText() {
-  return collectTextChunks().map(chunk => chunk.text).join("\n").slice(0, MAX_TEXT_CHARS);
+function getVisibleText(options = normalizeSnapshotOptions()) {
+  return collectTextChunks(options).map(chunk => chunk.text).join("\n").slice(0, options.textChars);
 }
 
 function getScrollState() {
@@ -508,17 +781,27 @@ function collectShadowWarnings() {
   return warnings;
 }
 
-function getFrameContext() {
-  const chunks = collectTextChunks();
+function getFrameContext(options = {}) {
+  const snapshotOptions = normalizeSnapshotOptions(options);
+  const chunks = collectTextChunks(snapshotOptions);
 
   return {
     url: location.href,
     title: document.title,
     timestamp: new Date().toISOString(),
-    text: chunks.map(chunk => chunk.text).join("\n").slice(0, MAX_TEXT_CHARS),
+    documentIdentity: getDocumentIdentity(),
+    snapshotMode: snapshotOptions.snapshotMode,
+    snapshotLimits: {
+      textChars: snapshotOptions.textChars,
+      chunks: snapshotOptions.chunks,
+      chunkChars: snapshotOptions.chunkChars,
+      elements: snapshotOptions.elements,
+      formValues: snapshotOptions.formValues
+    },
+    text: chunks.map(chunk => chunk.text).join("\n").slice(0, snapshotOptions.textChars),
     chunks,
-    elements: collectInteractiveElements(),
-    formValues: collectFormValues(),
+    elements: collectInteractiveElements(snapshotOptions),
+    formValues: collectFormValues(snapshotOptions),
     scroll: getScrollState(),
     warnings: collectShadowWarnings()
   };
@@ -677,6 +960,9 @@ async function runAction(action) {
     return { error: "Invalid action." };
   }
 
+  const freshnessError = verifyActionFreshness(action);
+  if (freshnessError) return freshnessError;
+
   const type = String(action.type || "");
 
   if (!["click", "type", "submit", "extract"].includes(type)) {
@@ -687,6 +973,9 @@ async function runAction(action) {
   if (resolved.error) return { error: resolved.error };
 
   const { el, root } = resolved;
+
+  const targetFreshnessError = verifyActionTargetFreshness(action, el, root);
+  if (targetFreshnessError) return targetFreshnessError;
 
   if (!isVisible(el)) {
     return { error: "Target element is not visible." };
@@ -709,6 +998,9 @@ async function previewAction(action) {
     return { error: "Invalid action." };
   }
 
+  const freshnessError = verifyActionFreshness(action);
+  if (freshnessError) return freshnessError;
+
   const type = String(action.type || "");
 
   if (!["click", "type", "submit"].includes(type)) {
@@ -719,6 +1011,9 @@ async function previewAction(action) {
   if (resolved.error) return { error: resolved.error };
 
   const { el, root } = resolved;
+
+  const targetFreshnessError = verifyActionTargetFreshness(action, el, root);
+  if (targetFreshnessError) return targetFreshnessError;
 
   if (actionLooksHighRisk(action, el, root)) {
     return { error: "Blocked high-risk payment, purchase, transfer, or destructive action." };
@@ -752,28 +1047,16 @@ function runScroll(action) {
 
 function runInjectScriptOnce(action) {
   const name = String(action.name || "");
-
   if (name !== "autoDismissDialogs") {
-    return { error: "Only the autoDismissDialogs recovery script is supported." };
+    return { error: "No content-script recovery injection is supported." };
   }
 
-  if (document.documentElement.dataset.chromeAiAgentAutoDismissDialogs === "true") {
-    return { ok: true, result: "autoDismissDialogs already installed" };
-  }
-
-  const script = document.createElement("script");
-  script.textContent = `
-    (() => {
-      window.alert = function noopAlert() {};
-      window.confirm = function confirmOk() { return true; };
-      window.print = function noopPrint() {};
-      document.documentElement.dataset.chromeAiAgentAutoDismissDialogs = "true";
-    })();
-  `;
-  (document.documentElement || document.head || document.body).appendChild(script);
-  script.remove();
-
-  return { ok: true, result: "autoDismissDialogs installed" };
+  // Overriding window.confirm() can silently authorize destructive site actions.
+  // Native dialogs must instead be handled by the background debugger, where it
+  // can dismiss alerts only and pause for confirmations/prompts.
+  return {
+    error: "Automatic dialog overrides are disabled. Dismiss alert dialogs through the browser debugger or resolve this dialog manually."
+  };
 }
 
 function runNavigateCurrentUrl(action) {
@@ -798,6 +1081,9 @@ async function runCollectionAction(action) {
     return { error: "Invalid collection action." };
   }
 
+  const freshnessError = verifyActionFreshness(action);
+  if (freshnessError) return freshnessError;
+
   const type = String(action.type || "");
 
   if (type === "scroll") return runScroll(action);
@@ -809,11 +1095,19 @@ async function runCollectionAction(action) {
   }
 
   if (type === "readFormValues") {
-    return { ok: true, result: "form values read", formValues: collectFormValues() };
+    return {
+      ok: true,
+      result: "form values read",
+      formValues: collectFormValues(action.snapshotOptions || action)
+    };
   }
 
   if (type === "extract") {
-    return { ok: true, result: "snapshot extracted", snapshot: getFrameContext() };
+    return {
+      ok: true,
+      result: "snapshot extracted",
+      snapshot: getFrameContext(action.snapshotOptions || action)
+    };
   }
 
   if (type === "injectScriptOnce") return runInjectScriptOnce(action);
@@ -824,6 +1118,9 @@ async function runCollectionAction(action) {
     if (resolved.error) return { error: resolved.error };
 
     const { el, root } = resolved;
+
+    const targetFreshnessError = verifyActionTargetFreshness(action, el, root);
+    if (targetFreshnessError) return targetFreshnessError;
 
     if (!isVisible(el)) return { error: "Target element is not visible." };
     if (actionLooksHighRisk(action, el, root) || actionLooksLikeBlockedWrite(action, el, root)) {
@@ -839,7 +1136,7 @@ async function runCollectionAction(action) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "GET_FRAME_CONTEXT" || message?.type === "GET_PAGE_CONTEXT") {
-    sendResponse(getFrameContext());
+    sendResponse(getFrameContext(message.snapshotOptions || message.options || {}));
     return false;
   }
 
@@ -858,7 +1155,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "GET_COLLECTION_SNAPSHOT") {
-    sendResponse(getFrameContext());
+    sendResponse(getFrameContext(message.snapshotOptions || message.options || { snapshotMode: "light" }));
     return false;
   }
 

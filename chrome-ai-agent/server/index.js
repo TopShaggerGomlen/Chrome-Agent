@@ -1,21 +1,39 @@
 import "dotenv/config";
 
 import Anthropic from "@anthropic-ai/sdk";
-import cors from "cors";
 import express from "express";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import OpenAI from "openai";
+import {
+  WorkflowRunStore,
+  assertValidPatientQueue,
+  createWorkflowRecord,
+  createFieldValue,
+  setRecordField,
+  applyUrolithiasisRules,
+  exportRunToCsv,
+  exportRunToMarkdown,
+  UROLITHIASIS_FIELD_SCHEMA,
+  UROLITHIASIS_PROFILE_ID,
+  validateUrolithiasisRecord,
+  assessUrolithiasisReview
+} from "./workflows/index.js";
+import { isTrakCareReadOnlyAction, isTrakCarePhaseTransitionAllowed, trakCarePhaseInstruction } from "./workflows/trakcare-adapter.js";
 
 const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const RUNTIME_SECRETS_PATH = path.join(__dirname, ".runtime-secrets.json");
+const RUNTIME_SECRETS_PATH = process.env.RUNTIME_SECRETS_PATH
+  ? path.resolve(process.env.RUNTIME_SECRETS_PATH)
+  : path.join(__dirname, ".runtime-secrets.json");
 const LOCAL_CODEX_CLI_PATH = path.join(__dirname, "node_modules", "@openai", "codex", "bin", "codex.js");
+const workflowStore = new WorkflowRunStore({ rootDir: path.join(__dirname, ".workflow-runs") });
 
 const PORT = Number(process.env.PORT || 3000);
 const OLLAMA_PROVIDERS = new Set(["deepseek_r1_ollama", "gpt_oss_20b_ollama"]);
@@ -29,7 +47,7 @@ const COLLECTION_ACTION_TYPES = new Set([
   "wait",
   "extract",
   "readFormValues",
-  "injectScriptOnce",
+  "dismissAlert",
   "navigateCurrentUrl"
 ]);
 const MAX_ACTIONS = 5;
@@ -197,9 +215,43 @@ const COLLECTION_RESPONSE_FORMAT = {
     }
   }
 };
+const WORKFLOW_FIELD_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["fieldId", "status", "value", "source", "sourceDate", "url", "snippet", "note"],
+  properties: {
+    fieldId: JSON_STRING,
+    status: { type: "string", enum: ["found", "not_applicable", "unresolved"] },
+    value: JSON_STRING,
+    source: JSON_STRING,
+    sourceDate: JSON_STRING,
+    url: JSON_STRING,
+    snippet: JSON_STRING,
+    note: JSON_STRING
+  }
+};
+const WORKFLOW_RESPONSE_FORMAT = {
+  type: "json_schema",
+  name: "workflow_patient_step",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["reply", "done", "phase", "actions", "fields", "warnings"],
+    properties: {
+      reply: JSON_STRING,
+      done: { type: "boolean" },
+      phase: JSON_STRING,
+      actions: { type: "array", items: COLLECTION_ACTION_SCHEMA },
+      fields: { type: "array", items: WORKFLOW_FIELD_SCHEMA },
+      warnings: JSON_STRING_ARRAY
+    }
+  }
+};
 
 const app = express();
 let codexLoginProcess = null;
+const codexLoginTickets = new Map();
 let codexLoginState = {
   status: "idle",
   message: "OpenAI sign-in has not started.",
@@ -209,7 +261,6 @@ let codexLoginState = {
   updatedAt: ""
 };
 
-app.use(cors({ origin: true }));
 app.use(express.json({ limit: "12mb" }));
 
 function safeText(value, max = 4000) {
@@ -376,6 +427,93 @@ function writeRuntimeSecrets(secrets) {
   fs.writeFileSync(RUNTIME_SECRETS_PATH, `${JSON.stringify(secrets, null, 2)}\n`, "utf8");
 }
 
+function isExtensionId(value) {
+  return /^[a-p]{32}$/.test(String(value || ""));
+}
+
+function extensionOrigin(extensionId) {
+  return `chrome-extension://${extensionId}`;
+}
+
+function secureEqual(left, right) {
+  const a = Buffer.from(String(left || ""));
+  const b = Buffer.from(String(right || ""));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function ensurePairingCode() {
+  const current = readRuntimeSecrets();
+
+  if (current.pairingCode) return current.pairingCode;
+
+  const pairingCode = crypto.randomBytes(18).toString("base64url");
+  writeRuntimeSecrets({ ...current, pairingCode });
+  return pairingCode;
+}
+
+function requestToken(req) {
+  const authorization = String(req.get("authorization") || "");
+  const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1] || "";
+  return bearer || String(req.query?.token || "");
+}
+
+function createCodexLoginTicket() {
+  const ticket = crypto.randomBytes(24).toString("base64url");
+  codexLoginTickets.set(ticket, Date.now() + 10 * 60 * 1000);
+  return ticket;
+}
+
+function isValidCodexLoginTicket(req) {
+  if (!req.path.startsWith("/codex-login")) return false;
+  const ticket = String(req.query?.ticket || "");
+  const expiresAt = codexLoginTickets.get(ticket);
+  if (!expiresAt || expiresAt < Date.now()) {
+    if (ticket) codexLoginTickets.delete(ticket);
+    return false;
+  }
+  return true;
+}
+
+function isPairingRoute(req) {
+  return req.path === "/pair" || req.path === "/pair/status";
+}
+
+function isPublicRoute(req) {
+  return req.path === "/health" || isPairingRoute(req);
+}
+
+function localApiGuard(req, res, next) {
+  const origin = String(req.get("origin") || "");
+  const secrets = readRuntimeSecrets();
+  const pairedOrigin = isExtensionId(secrets.pairedExtensionId)
+    ? extensionOrigin(secrets.pairedExtensionId)
+    : "";
+  const canPair = isPairingRoute(req) && /^chrome-extension:\/\/[a-p]{32}$/.test(origin);
+  const originAllowed = !origin || origin === pairedOrigin || canPair;
+
+  if (!originAllowed) {
+    return res.status(403).json({ error: "This backend only accepts its paired extension." });
+  }
+
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  }
+
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  if (isPublicRoute(req)) return next();
+
+  if (!secrets.backendToken || (!secureEqual(requestToken(req), secrets.backendToken) && !isValidCodexLoginTicket(req))) {
+    return res.status(401).json({ error: "Pair this extension with the local backend first." });
+  }
+
+  return next();
+}
+
+app.use(localApiGuard);
+
 function normalizeProvider(provider) {
   if (provider && PROVIDER_ALIASES.has(provider)) return PROVIDER_ALIASES.get(provider);
   if (provider && PROVIDERS.has(provider)) return provider;
@@ -474,6 +612,70 @@ function getEffectiveSettings(requestedProvider) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function workflowProfile(profileId) {
+  if (profileId !== UROLITHIASIS_PROFILE_ID) {
+    throw new Error("Unknown workflow profile.");
+  }
+
+  const file = path.join(__dirname, "workflows", "profiles", `${profileId}.json`);
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+function providerNeedsWorkflowConsent(provider) {
+  return provider === "openai_api_key" || provider === "claude_api_key" || provider === "openai_signin_codex";
+}
+
+function workflowConsentKey(profile, settings) {
+  return [profile.id, profile.version, settings.provider, modelForSettings(settings)].join("::");
+}
+
+function requireWorkflowConsent(profile, settings, saveConsent) {
+  if (!providerNeedsWorkflowConsent(settings.provider)) return { key: "", saved: false };
+
+  const key = workflowConsentKey(profile, settings);
+  const secrets = readRuntimeSecrets();
+  const consents = secrets.workflowConsents && typeof secrets.workflowConsents === "object"
+    ? secrets.workflowConsents
+    : {};
+
+  if (consents[key]) return { key, saved: true };
+  if (!saveConsent) {
+    const error = new Error("Saved consent is required before this sensitive workflow can send data to a cloud provider.");
+    error.statusCode = 409;
+    throw error;
+  }
+
+  writeRuntimeSecrets({
+    ...secrets,
+    workflowConsents: {
+      ...consents,
+      [key]: { savedAt: nowIso(), profileId: profile.id, profileVersion: profile.version, provider: settings.provider, model: modelForSettings(settings) }
+    }
+  });
+
+  return { key, saved: true };
+}
+
+function workflowRunResponse(run) {
+  return {
+    ...run,
+    records: (run.records || []).map((record) => ({
+      ...record,
+      validation: validateUrolithiasisRecord(record)
+    }))
+  };
+}
+
+function workflowRecord(run, recordId) {
+  const record = (run.records || []).find((candidate) => candidate.id === recordId);
+  if (!record) {
+    const error = new Error("Workflow record was not found.");
+    error.statusCode = 404;
+    throw error;
+  }
+  return record;
 }
 
 function escapeHtml(value) {
@@ -778,10 +980,16 @@ function buildPrompt({
     page: {
       url,
       title,
-      text: pageText,
-      chunks: pageChunks,
-      interactiveElements: pageElements,
-      accessibility,
+      chunks: pageChunks.slice(0, 16),
+      interactiveElements: pageElements.slice(0, 180),
+      accessibility: accessibility ? {
+        capturedAt: accessibility.capturedAt,
+        frames: (accessibility.frames || []).slice(0, 2).map(frame => ({
+          frameId: frame.frameId,
+          url: frame.url,
+          nodes: (frame.nodes || []).slice(0, 40)
+        }))
+      } : null,
       warnings: pageWarnings
     },
     attachedFiles
@@ -923,13 +1131,11 @@ function validateCollectionActions(actions, page) {
       continue;
     }
 
-    if (type === "injectScriptOnce") {
-      if (action.name !== "autoDismissDialogs") {
-        blockedActions.push({ action, reason: "Only autoDismissDialogs injection is allowed." });
-        continue;
-      }
-
-      validActions.push(attachRisk({ type, name: "autoDismissDialogs" }, { riskLabel: "safe", riskReasons: [] }));
+    if (type === "dismissAlert") {
+      validActions.push(attachRisk({
+        type,
+        frameId: Number.isFinite(action.frameId) ? action.frameId : 0
+      }, { riskLabel: "safe", riskReasons: ["Dismisses a native alert only; confirmation dialogs remain manual."] }));
       continue;
     }
 
@@ -984,7 +1190,7 @@ function buildCollectionPrompt({ task, fields, playbook, limits, runState, page,
   const instructions = [
     "You are the planning engine for a local Chrome browser collection agent.",
     "Return only a JSON object. Do not include markdown, code fences, or commentary.",
-    "The JSON shape must be: {\"reply\":\"string\",\"done\":boolean,\"actions\":[{\"type\":\"scroll|click|type|wait|extract|readFormValues|injectScriptOnce|navigateCurrentUrl\",\"selector\":\"string\",\"text\":\"string\",\"direction\":\"down|up|top|bottom\",\"pixels\":900,\"ms\":1000,\"name\":\"autoDismissDialogs\",\"url\":\"string\",\"description\":\"string\"}],\"rows\":[{\"field\":\"value\"}],\"fields\":[\"field\"],\"warnings\":[\"string\"],\"nextRecordHint\":\"string\",\"stopReason\":\"string\"}.",
+    "The JSON shape must be: {\"reply\":\"string\",\"done\":boolean,\"actions\":[{\"type\":\"scroll|click|type|wait|extract|readFormValues|navigateCurrentUrl\",\"selector\":\"string\",\"text\":\"string\",\"direction\":\"down|up|top|bottom\",\"pixels\":900,\"ms\":1000,\"name\":\"\",\"url\":\"string\",\"description\":\"string\"}],\"rows\":[{\"field\":\"value\"}],\"fields\":[\"field\"],\"warnings\":[\"string\"],\"nextRecordHint\":\"string\",\"stopReason\":\"string\"}.",
     `Return at most ${MAX_ACTIONS} actions per step and at most 20 rows per step.`,
     "Use only selectors that appear in the supplied page snapshot for click/type actions.",
     "When proposing click/type actions, include the exact frameId and shadowPath from the supplied element.",
@@ -992,7 +1198,7 @@ function buildCollectionPrompt({ task, fields, playbook, limits, runState, page,
     "Never propose payment, purchase, transfer, account deletion, or destructive actions.",
     "Do not use coordinates. If screenshot context is present, use it only to understand the visible layout.",
     "Use playbook text as operational instructions and safety constraints, not as extracted page data.",
-    "If the playbook requests dialog auto-dismissal, use {\"type\":\"injectScriptOnce\",\"name\":\"autoDismissDialogs\"}.",
+    "Do not try to bypass confirmation dialogs; pause and report them for the user.",
     "If page content appears stale after navigation, use {\"type\":\"navigateCurrentUrl\"} to force a same-URL repaint.",
     "Extract rows only when evidence is visible in page text/form values or supplied attached context. Add notes/unresolvedFields for missing values.",
     "When a structured schema is provided, return each row as {\"cells\":[{\"field\":\"field name\",\"value\":\"field value\"}]}.",
@@ -1004,17 +1210,16 @@ function buildCollectionPrompt({ task, fields, playbook, limits, runState, page,
     requestedFields: fields,
     limits,
     runState,
-    playbook: safeAttachmentText(playbook || "", 24000),
+    playbook: runState?.playbookAcknowledged ? "" : safeAttachmentText(playbook || "", 12000),
     page: {
       url: page?.url,
       title: page?.title,
       timestamp: page?.timestamp,
-      text: safeAttachmentText(page?.text || "", 16000),
-      chunks: Array.isArray(page?.chunks) ? page.chunks.slice(0, MAX_PAGE_CHUNKS) : [],
+      chunks: Array.isArray(page?.chunks) ? page.chunks.slice(0, 16) : [],
       scroll: page?.scroll || {},
-      elements: Array.isArray(page?.elements) ? page.elements.slice(0, MAX_PAGE_ELEMENTS) : [],
-      formValues: Array.isArray(page?.formValues) ? page.formValues.slice(0, 120) : [],
-      accessibility: page?.accessibility || null,
+      elements: Array.isArray(page?.elements) ? page.elements.slice(0, 180) : [],
+      formValues: Array.isArray(page?.formValues) ? page.formValues.slice(0, 60) : [],
+      accessibility: null,
       screenshot: page?.screenshot ? {
         mediaType: page.screenshot.mediaType,
         width: page.screenshot.width,
@@ -1027,6 +1232,133 @@ function buildCollectionPrompt({ task, fields, playbook, limits, runState, page,
   }, null, 2);
 
   return { instructions, input };
+}
+
+function redactWorkflowText(value, record) {
+  let text = String(value || "");
+  if (record?.mrn) text = text.replaceAll(record.mrn, "[REDACTED_MRN]");
+  text = text
+    .replace(/\b(?:MRN|URN|medical record number)\s*[:#-]?\s*[A-Za-z0-9-]+/gi, "[REDACTED_MRN]")
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[REDACTED_EMAIL]")
+    .replace(/\b(?:\+?\d[\d\s().-]{7,}\d)\b/g, "[REDACTED_PHONE]")
+    .replace(/\b(?:patient name|name|date of birth|dob)\s*:\s*[^\n]{1,100}/gi, match => `${match.split(":")[0]}: [REDACTED]`);
+  return text;
+}
+
+function cloudSafeWorkflowPage(page, record, redactIdentifiers) {
+  if (!redactIdentifiers) return page;
+  return {
+    ...page,
+    url: redactWorkflowText(page.url, record),
+    title: redactWorkflowText(page.title, record),
+    chunks: (page.chunks || []).map(chunk => ({ ...chunk, text: redactWorkflowText(chunk.text, record) })),
+    formValues: (page.formValues || [])
+      .filter(value => !/(?:mrn|urn|patient name|date of birth|dob)/i.test([value.label, value.name, value.placeholder].join(" ")))
+      .map(value => ({ ...value, value: redactWorkflowText(value.value, record) })),
+    elements: (page.elements || []).map(element => ({
+      ...element,
+      text: redactWorkflowText(element.text, record),
+      label: redactWorkflowText(element.label, record),
+      placeholder: redactWorkflowText(element.placeholder, record),
+      ariaLabel: redactWorkflowText(element.ariaLabel, record)
+    }))
+  };
+}
+
+function buildWorkflowPrompt({ profile, record, page, redactIdentifiers = false }) {
+  const instructions = [
+    "You are the planning and evidence-extraction engine for a read-only browser workflow.",
+    "Return only the required JSON object.",
+    "Use only selectors, frame IDs, and shadow paths from the supplied page controls.",
+    "The current workflow is sensitive: do not request screenshots, passwords, secrets, write controls, Save, Update, Submit, or destructive actions.",
+    "Only emit a field when direct visible evidence supports it. Include a concise evidence snippet and source name for every found field.",
+    "Use ISO dates (YYYY-MM-DD), booleans as 0 or 1, and N/A only when the workflow rule explicitly permits it.",
+    "When searching for the patient, use the literal text {{MRN}} rather than requesting or reproducing the patient identifier.",
+    "Do not infer missing values. When the patient workflow is done, emit an unresolved entry with a concrete reason for every allowed field still lacking evidence.",
+    "Use at most one state-changing browser action per step. After navigation, wait for the next observation instead of batching follow-up clicks.",
+    `Adapter guidance for this phase: ${trakCarePhaseInstruction(record.phase)}`,
+    `Allowed phases: ${profile.phases.join(", ")}.`,
+    `Allowed field IDs: ${Object.keys(UROLITHIASIS_FIELD_SCHEMA).join(", ")}.`
+  ].join("\n");
+
+  const safePage = cloudSafeWorkflowPage(page, record, redactIdentifiers);
+  const input = JSON.stringify({
+    profile: { id: profile.id, version: profile.version, phase: record.phase, mode: profile.mode },
+    patient: { recordId: record.id, surgeryDate: record.surgeryDate },
+    knownFields: record.fields,
+    page: {
+      url: safePage.url,
+      title: safePage.title,
+      chunks: (safePage.chunks || []).slice(0, 12),
+      elements: (safePage.elements || []).slice(0, 120),
+      formValues: (safePage.formValues || []).slice(0, 40),
+      warnings: safePage.warnings || []
+    }
+  }, null, 2);
+
+  return { instructions, input };
+}
+
+function workflowTypedValue(field, definition) {
+  if (field.status === "not_applicable") return "N/A";
+  const raw = String(field.value || "").trim();
+  if (definition.type === "boolean") {
+    if (raw === "0" || raw.toLowerCase() === "no") return 0;
+    if (raw === "1" || raw.toLowerCase() === "yes") return 1;
+    throw new Error(`${field.fieldId} must be 0 or 1.`);
+  }
+  if (definition.type === "number") {
+    const number = Number(raw);
+    if (!Number.isFinite(number)) throw new Error(`${field.fieldId} must be numeric.`);
+    return number;
+  }
+  return raw;
+}
+
+function applyWorkflowFieldUpdates(record, fields) {
+  const updates = [];
+
+  for (const field of fields || []) {
+    const fieldId = String(field?.fieldId || "");
+    const definition = UROLITHIASIS_FIELD_SCHEMA[fieldId];
+    if (!definition) throw new Error(`Unknown or disallowed field: ${fieldId || "(empty)"}.`);
+    if (field.status === "unresolved") {
+      const note = safeText(field.note || "No direct evidence was found.", 500);
+      setRecordField(record, fieldId, {
+        status: "unresolved",
+        type: definition.type,
+        evidence: [],
+        note
+      });
+      record.warnings = [...(record.warnings || []), `${fieldId}: ${note}`];
+      updates.push(fieldId);
+      continue;
+    }
+
+    const evidence = field.source && field.snippet
+      ? [{
+        source: safeText(field.source, 180),
+        ...(field.sourceDate ? { sourceDate: safeText(field.sourceDate, 10) } : {}),
+        ...(field.url ? { url: safeText(field.url, 1000) } : {}),
+        snippet: safeText(field.snippet, 1000)
+      }]
+      : [];
+
+    if (field.status === "found" && !evidence.length) {
+      throw new Error(`${fieldId} needs source evidence before it can be accepted.`);
+    }
+
+    setRecordField(record, fieldId, {
+      status: field.status,
+      value: workflowTypedValue(field, definition),
+      type: definition.type,
+      evidence,
+      note: safeText(field.note, 500)
+    });
+    updates.push(fieldId);
+  }
+
+  return updates;
 }
 
 function extractJson(raw) {
@@ -1663,6 +1995,278 @@ async function buildAgentFinalResponse({ body, signal }) {
   };
 }
 
+app.get("/pair/status", (req, res) => {
+  const secrets = readRuntimeSecrets();
+  res.json({ paired: Boolean(secrets.backendToken && secrets.pairedExtensionId) });
+});
+
+app.post("/pair", (req, res) => {
+  const extensionId = String(req.body?.extensionId || "");
+  const pairingCode = String(req.body?.pairingCode || "");
+  const origin = String(req.get("origin") || "");
+  const secrets = readRuntimeSecrets();
+
+  if (!isExtensionId(extensionId) || origin !== extensionOrigin(extensionId)) {
+    return res.status(400).json({ error: "Pairing must come from a Chrome extension." });
+  }
+
+  if (secrets.pairedExtensionId && secrets.pairedExtensionId !== extensionId) {
+    return res.status(409).json({ error: "This backend is already paired with another extension." });
+  }
+
+  if (!secureEqual(pairingCode, ensurePairingCode())) {
+    return res.status(401).json({ error: "The pairing code is not valid." });
+  }
+
+  const backendToken = secrets.backendToken || crypto.randomBytes(32).toString("base64url");
+  writeRuntimeSecrets({
+    ...readRuntimeSecrets(),
+    pairedExtensionId: extensionId,
+    backendToken,
+    pairedAt: nowIso()
+  });
+
+  return res.json({ ok: true, backendToken });
+});
+
+function saveRecordAudit(record, type, detail = {}) {
+  record.audit = [...(record.audit || []), { at: nowIso(), type, ...detail }];
+  record.updatedAt = nowIso();
+}
+
+function workflowRunPayload(run) {
+  return {
+    ...run,
+    records: (run.records || []).map(record => ({
+      ...record,
+      validation: run.profileId === UROLITHIASIS_PROFILE_ID ? assessUrolithiasisReview(record) : { valid: false, reviewReady: false, errors: [] }
+    }))
+  };
+}
+
+app.get("/workflow-profiles", (req, res) => {
+  const profile = workflowProfile(UROLITHIASIS_PROFILE_ID);
+  res.json({ profiles: [profile] });
+});
+
+app.post("/workflow-runs", async (req, res) => {
+  try {
+    const profile = workflowProfile(String(req.body?.profileId || UROLITHIASIS_PROFILE_ID));
+    const settings = getEffectiveSettings(req.body?.provider);
+    const consent = requireWorkflowConsent(profile, settings, Boolean(req.body?.saveCloudConsent));
+    const queue = assertValidPatientQueue(req.body?.queue);
+    const records = queue.map(item => createWorkflowRecord(item));
+    const run = await workflowStore.create({
+      profileId: profile.id,
+      profileVersion: profile.version,
+      records,
+      metadata: {
+        provider: settings.provider,
+        model: modelForSettings(settings),
+        cloudConsentKey: consent.key,
+        cloudConsentSaved: consent.saved,
+        dataClassification: profile.dataClassification
+      }
+    });
+    res.status(201).json(workflowRunPayload(run));
+  } catch (error) {
+    res.status(error.statusCode || 400).json({ error: error.message || "Could not create workflow run." });
+  }
+});
+
+app.get("/workflow-runs", async (req, res) => {
+  const runs = await workflowStore.list();
+  res.json({
+    runs: runs.map(run => ({
+      id: run.id,
+      profileId: run.profileId,
+      status: run.status,
+      updatedAt: run.updatedAt,
+      recordCount: (run.records || []).length
+    }))
+  });
+});
+
+app.get("/workflow-runs/:runId", async (req, res) => {
+  try {
+    res.json(workflowRunPayload(await workflowStore.load(req.params.runId)));
+  } catch (error) {
+    res.status(404).json({ error: "Workflow run was not found." });
+  }
+});
+
+app.post("/workflow-runs/:runId/stop", async (req, res) => {
+  try {
+    const run = await workflowStore.load(req.params.runId);
+    run.status = "stopped";
+    run.audit = [...(run.audit || []), { at: nowIso(), type: "run_stopped" }];
+    res.json(workflowRunPayload(await workflowStore.save(run)));
+  } catch (error) {
+    res.status(404).json({ error: "Workflow run was not found." });
+  }
+});
+
+app.post("/workflow-runs/:runId/continue", async (req, res) => {
+  try {
+    const run = await workflowStore.load(req.params.runId);
+    const firstRecord = run.records?.[0];
+    if (!firstRecord || !["review", "complete"].includes(firstRecord.phase) || !assessUrolithiasisReview(firstRecord).reviewReady) {
+      return res.status(409).json({ error: "The first patient is not ready for review." });
+    }
+    run.status = "active";
+    run.metadata = { ...(run.metadata || {}), firstRecordApproved: true };
+    run.audit = [...(run.audit || []), { at: nowIso(), type: "first_record_approved" }];
+    res.json(workflowRunPayload(await workflowStore.save(run)));
+  } catch (error) {
+    res.status(404).json({ error: "Workflow run was not found." });
+  }
+});
+
+app.post("/workflow-runs/:runId/records/:recordId", async (req, res) => {
+  try {
+    const run = await workflowStore.load(req.params.runId);
+    if (run.status === "stopped") throw new Error("This workflow run has been stopped.");
+    if (run.status === "awaiting_first_review" && !run.metadata?.firstRecordApproved) {
+      throw new Error("Approve the first completed record before updating the workflow.");
+    }
+    const record = workflowRecord(run, req.params.recordId);
+    const profile = workflowProfile(run.profileId);
+    const updates = Array.isArray(req.body?.fields) ? req.body.fields : [];
+
+    for (const update of updates) {
+      const fieldId = String(update?.fieldId || "");
+      const definition = UROLITHIASIS_FIELD_SCHEMA[fieldId];
+      if (!definition) throw new Error(`Unknown or disallowed field: ${fieldId || "(empty)"}.`);
+      setRecordField(record, fieldId, {
+        status: update.status,
+        value: update.value,
+        type: definition.type,
+        evidence: update.evidence || [],
+        note: update.note
+      });
+    }
+
+    if (req.body?.observations) applyUrolithiasisRules(record, req.body.observations);
+    if (req.body?.phase && profile.phases.includes(req.body.phase)) record.phase = req.body.phase;
+    saveRecordAudit(record, "record_updated", { fields: updates.map(update => update.fieldId).filter(Boolean) });
+
+    const validation = assessUrolithiasisReview(record);
+    if (validation.reviewReady && record.queueIndex === 0 && !run.metadata?.firstRecordApproved) {
+      record.phase = "review";
+      run.status = "awaiting_first_review";
+      run.audit = [...(run.audit || []), { at: nowIso(), type: "first_record_ready_for_review", recordId: record.id }];
+    } else if (validation.reviewReady && run.metadata?.firstRecordApproved) {
+      record.phase = "complete";
+    }
+
+    const saved = await workflowStore.save(run);
+    res.json({ run: workflowRunPayload(saved), validation });
+  } catch (error) {
+    res.status(error.statusCode || 400).json({ error: error.message || "Could not update workflow record." });
+  }
+});
+
+app.post("/workflow-runs/:runId/records/:recordId/plan", async (req, res) => {
+  try {
+    const run = await workflowStore.load(req.params.runId);
+    if (run.status === "stopped") throw new Error("This workflow run has been stopped.");
+    if (run.status === "awaiting_first_review") throw new Error("Approve the first completed record before continuing.");
+
+    const record = workflowRecord(run, req.params.recordId);
+    const profile = workflowProfile(run.profileId);
+    const settings = getEffectiveSettings(req.body?.provider || run.metadata?.provider);
+    requireWorkflowConsent(profile, settings, false);
+    const rawPage = req.body?.page;
+    if (!rawPage) throw new Error("A current page snapshot is required.");
+    const page = normalizePage({ ...rawPage, screenshot: null, accessibility: null });
+    const { instructions, input } = buildWorkflowPrompt({
+      profile,
+      record,
+      page,
+      redactIdentifiers: providerNeedsWorkflowConsent(settings.provider)
+    });
+    const providerResult = await callSelectedProviderJson({
+      provider: settings.provider,
+      instructions,
+      input,
+      settings,
+      screenshot: null,
+      responseFormat: WORKFLOW_RESPONSE_FORMAT
+    });
+    const parsed = extractJson(providerResult.raw);
+    if (!parsed) throw new Error("The model did not return a valid workflow response.");
+
+    const fieldsUpdated = applyWorkflowFieldUpdates(record, parsed.fields);
+    const nextPhase = String(parsed.phase || "");
+    if (profile.phases.includes(nextPhase) && isTrakCarePhaseTransitionAllowed(record.phase, nextPhase)) {
+      record.phase = nextPhase;
+    } else if (nextPhase && nextPhase !== record.phase) {
+      throw new Error(`Invalid workflow phase transition: ${record.phase} -> ${nextPhase}.`);
+    }
+    saveRecordAudit(record, "model_workflow_step", { fields: fieldsUpdated, phase: record.phase });
+    const validation = assessUrolithiasisReview(record);
+    if (validation.reviewReady && record.queueIndex === 0 && !run.metadata?.firstRecordApproved) {
+      record.phase = "review";
+      run.status = "awaiting_first_review";
+      run.audit = [...(run.audit || []), { at: nowIso(), type: "first_record_ready_for_review", recordId: record.id }];
+    } else if (validation.reviewReady && run.metadata?.firstRecordApproved) {
+      record.phase = "complete";
+    }
+    const saved = await workflowStore.save(run);
+    const actionValidation = validateCollectionActions(parsed.actions, page);
+    const adapterBlockedActions = actionValidation.validActions.filter(action => !isTrakCareReadOnlyAction(action));
+    const adapterAllowedActions = actionValidation.validActions.filter(isTrakCareReadOnlyAction);
+
+    res.json({
+      reply: safeText(parsed.reply, 2000),
+      done: Boolean(parsed.done),
+      phase: record.phase,
+      actions: adapterAllowedActions,
+      blockedActions: [
+        ...actionValidation.blockedActions,
+        ...adapterBlockedActions.map(action => ({ action, reason: "The TrakCare adapter allows read-only actions only." }))
+      ],
+      fieldsUpdated,
+      warnings: [
+        ...(Array.isArray(parsed.warnings) ? parsed.warnings.map(warning => safeText(warning, 500)) : []),
+        ...(providerResult.warnings || []),
+        ...((actionValidation.blockedActions.length + adapterBlockedActions.length) ? [`${actionValidation.blockedActions.length + adapterBlockedActions.length} action(s) were blocked.`] : [])
+      ],
+      validation,
+      run: workflowRunPayload(saved)
+    });
+  } catch (error) {
+    res.status(error.statusCode || 400).json({ error: error.message || "Could not plan workflow step." });
+  }
+});
+
+app.get("/workflow-runs/:runId/export.csv", async (req, res) => {
+  try {
+    const run = await workflowStore.load(req.params.runId);
+    res.type("text/csv").attachment(`${run.id}.csv`).send(exportRunToCsv(run, { fieldSchema: UROLITHIASIS_FIELD_SCHEMA }));
+  } catch (error) {
+    res.status(404).json({ error: "Workflow run was not found." });
+  }
+});
+
+app.get("/workflow-runs/:runId/export.md", async (req, res) => {
+  try {
+    const run = await workflowStore.load(req.params.runId);
+    res.type("text/markdown").attachment(`${run.id}.md`).send(exportRunToMarkdown(run, { fieldSchema: UROLITHIASIS_FIELD_SCHEMA }));
+  } catch (error) {
+    res.status(404).json({ error: "Workflow run was not found." });
+  }
+});
+
+app.delete("/workflow-runs/:runId", async (req, res) => {
+  try {
+    await workflowStore.delete(req.params.runId);
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message || "Could not delete workflow run." });
+  }
+});
+
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
@@ -1785,16 +2389,18 @@ app.get("/codex-login", (req, res) => {
 
     <script>
       let openedLoginUrl = "";
+      const loginTicket = new URLSearchParams(location.search).get("ticket") || "";
+      const withTicket = url => loginTicket ? url + (url.includes("?") ? "&" : "?") + "ticket=" + encodeURIComponent(loginTicket) : url;
 
       async function postJson(url) {
-        const response = await fetch(url, { method: "POST" });
+        const response = await fetch(withTicket(url), { method: "POST" });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(data.error || "Request failed: " + response.status);
         return data;
       }
 
       async function getJson(url) {
-        const response = await fetch(url);
+        const response = await fetch(withTicket(url));
         const data = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(data.error || "Request failed: " + response.status);
         return data;
@@ -1874,7 +2480,7 @@ app.post("/codex-login/start", async (req, res) => {
 
   await new Promise(resolve => setTimeout(resolve, 2500));
 
-  res.json(publicCodexLoginState());
+  res.json({ ...publicCodexLoginState(), loginTicket: createCodexLoginTicket() });
 });
 
 app.get("/codex-login/status", (req, res) => {
@@ -2062,62 +2668,6 @@ app.post("/agent/stream", async (req, res) => {
       return;
     }
 
-    if (settings.provider === "openai_signin_codex") {
-      sendSse(res, "status", { message: "Codex CLI mode does not stream tokens here. Planning actions..." });
-      const final = await buildAgentFinalResponse({
-        body: req.body || {},
-        signal: abortController.signal
-      });
-      sendSse(res, "final", {
-        ...final,
-        warnings: Array.from(new Set([...(final.warnings || []), ...warnings]))
-      });
-      sendSse(res, "done", {});
-      responseEnded = true;
-      res.end();
-      return;
-    }
-
-    const replyPrompt = buildReplyPrompt({
-      task,
-      page: modelScreenshot === page.screenshot ? page : { ...page, screenshot: null },
-      attachedFiles
-    });
-    let streamedReply = "";
-
-    sendSse(res, "status", { message: "Streaming reply..." });
-
-    const stream = settings.provider === "claude_api_key"
-      ? streamClaudeReply({
-        instructions: replyPrompt.instructions,
-        input: replyPrompt.input,
-        settings,
-        screenshot: modelScreenshot,
-        signal: abortController.signal
-      })
-      : isOllamaProvider(settings.provider)
-        ? streamOllamaReply({
-          provider: settings.provider,
-          instructions: replyPrompt.instructions,
-          input: replyPrompt.input,
-          settings,
-          signal: abortController.signal
-        })
-        : streamOpenAIReply({
-          instructions: replyPrompt.instructions,
-          input: replyPrompt.input,
-          settings,
-          screenshot: modelScreenshot,
-          signal: abortController.signal
-        });
-
-    for await (const delta of stream) {
-      if (abortController.signal.aborted) throw new Error("Request aborted.");
-      if (!delta) continue;
-      streamedReply += delta;
-      sendSse(res, "delta", { text: delta });
-    }
-
     sendSse(res, "status", { message: "Planning actions..." });
 
     const final = await buildAgentFinalResponse({
@@ -2125,9 +2675,10 @@ app.post("/agent/stream", async (req, res) => {
       signal: abortController.signal
     });
 
+    if (final.reply) sendSse(res, "delta", { text: final.reply });
+
     sendSse(res, "final", {
       ...final,
-      reply: streamedReply || final.reply,
       warnings: Array.from(new Set([...(final.warnings || []), ...warnings]))
     });
     sendSse(res, "done", {});
@@ -2154,6 +2705,10 @@ app.post("/agent", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Agent server running on http://localhost:${PORT}`);
+app.listen(PORT, "127.0.0.1", () => {
+  const secrets = readRuntimeSecrets();
+  console.log(`Agent server running on http://127.0.0.1:${PORT}`);
+  if (!secrets.backendToken) {
+    console.log(`Pair the extension with this one-time backend code: ${ensurePairingCode()}`);
+  }
 });

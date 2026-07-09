@@ -7,3 +7,5 @@ server/.runtime-secrets.json
 dist/
 build/
 *.log
+.workflow-runs/
+server/.workflow-runs/

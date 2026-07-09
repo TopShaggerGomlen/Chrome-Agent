@@ -1,15 +1,15 @@
 # Chrome AI Agent
 
-A local MVP Chrome extension that opens in the Chrome side panel, reads the current page with deep browser context, streams replies from a local AI backend, and runs approved task batches.
+A local Chrome extension that opens in the side panel, reads the current page with bounded browser context, returns structured AI plans through a local backend, and runs approved task batches.
 
 ## Features
 
 - Chrome side panel UI
-- Streams Ask replies from the backend
+- Returns one schema-validated Ask response containing the reply and proposed actions
 - Reads visible page text, page chunks, forms, and interactive elements
 - Aggregates accessible iframes and routes actions to the correct frame
 - Extracts open shadow DOM content and reports inaccessible closed shadow roots
-- Extracts a bounded Chrome accessibility tree through the debugger API
+- Uses bounded lightweight context by default and accessibility data only when explicitly needed
 - Supports opt-in visible-tab screenshot context
 - Sends page context to a local Node backend
 - Supports OpenAI API key mode
@@ -24,13 +24,13 @@ A local MVP Chrome extension that opens in the Chrome side panel, reads the curr
 - Exports collected rows as Markdown
 - Proposes click/type/submit/extract actions
 - Previews click/type/submit targets by scrolling/highlighting the element before execution
-- Automatically runs non-blocked requested actions after planning
+- Requires one explicit approval for each proposed browser action batch
 - Retries selector failures after short DOM-settle backoff windows, rereads the page, rematches by label/text/role, and retries once
 - Applies preview, rematch, and retry recovery to Collection Mode click/type actions
 - Shows a clean action history for proposed, blocked, retrying, executed, failed, and stopped actions
 - Exports action history as Markdown or JSON for debugging
 - Shows `safe`, `caution`, and `blocked` risk labels for proposed actions
-- Provides a global **Stop** button for streaming requests, action batches, and collection runs
+- Provides a global **Stop** button for requests, action batches, collection runs, and workflow runs
 - Allows ordinary form submit when the user explicitly asks for submit
 - Blocks password, OTP, card, payment, purchase, transfer, crypto, account deletion, and destructive actions
 - Includes first-run permission and safety onboarding in the side panel
@@ -131,7 +131,7 @@ npm run dev
 Check health:
 
 ```bash
-curl http://localhost:3000/health
+curl http://127.0.0.1:3000/health
 ```
 
 Expected:
@@ -151,6 +151,7 @@ Expected:
 7. Open any normal website.
 8. Click the extension icon.
 9. The side panel should open.
+10. On first connection, copy the one-time pairing code printed by the local backend into **Backend pairing code** and save the provider settings. The backend then accepts requests only from that extension.
 
 ## Test prompts
 
@@ -176,7 +177,7 @@ You can also attach text-based files from the composer, such as `.txt`, `.md`, `
 
 Enable **Screenshot** in the composer when you want the current visible tab image included as extra context. Screenshots are opt-in per request. OpenAI and Claude API-key modes can receive screenshot image input; OpenAI sign-in through Codex CLI and Ollama self-hosted modes omit screenshot image input and use the text/accessibility context instead.
 
-Use **Stop** to cancel an in-flight streaming request, stop before the next action in a running batch, or request that Collection Mode stop after the current step.
+Use **Stop** to cancel an in-flight request, stop before the next action in a running batch, or request that Collection Mode or Workflow Mode stop after the current step.
 
 The prompt box auto-resizes as you type. Press `Enter` to ask without clicking the button, or `Shift+Enter` to insert a new line. The side panel preserves the last task draft locally so accidental panel closes do not erase the prompt.
 
@@ -188,15 +189,23 @@ Collection Mode is for longer website navigation and extraction workflows. Enter
 
 When you press **Start Collection**, it loops through deep page snapshots, backend planning, validated browser actions, and row capture until it finishes, reaches a limit, is blocked by safety validation, or you press **Stop**. By default it pauses after the first captured record so you can review it before continuing.
 
-Collection snapshots include accessible frames, chunked text, interactive elements, form values, and accessibility context. If **Screenshot** is enabled, collection steps also include opt-in visible-tab screenshot context for API-key providers.
+Collection snapshots use bounded lightweight DOM context by default. The debugger accessibility tree is an on-demand fallback; screenshots are opt-in for ordinary tasks and omitted in sensitive workflows.
 
 Collection click/type actions use the same target preview, selector rematch, retry backoff, and action history recording as normal task batches. Longer extraction workflows therefore recover from async page rendering and selector drift instead of failing immediately when a page layout changes.
 
 Use **Download .md** to export the collected rows, warnings, run summary, and source URLs as a Markdown file. Collection Mode is Markdown-first; Excel writing is not implemented in this version.
 
+## Workflow Mode
+
+Workflow Mode is the resumable, evidence-backed path for structured records. Its first profile is the Urolithiasis extraction workflow. Paste one patient per line as `MRN,YYYY-MM-DD[,externalId]`, then choose **Run First Patient**. The first record pauses only when it is ready for review; unresolved fields remain flagged with their reason. **Approve & Continue** runs the remaining queue, and **Stop** saves the local run after the current action.
+
+Workflow runs persist locally under `server/.workflow-runs/` until deleted from the side panel. CSV and Markdown exports include typed values and evidence audit. Direct Excel reading/writing and workbook sync are intentionally deferred.
+
+Sensitive workflow profiles minimize cloud context: screenshots are disabled, identifiers are redacted from planner prompts, and a saved approval is required for each workflow/profile/provider/model combination. Local run files are not encrypted in this version; use a device and account appropriate for the records you handle.
+
 ## Action behavior
 
-The extension automatically runs validated, non-blocked actions after a request finishes planning. It does not ask for an in-app approval before each normal click/type/submit/extract action.
+The extension displays proposed actions and requires **Run action batch** once before normal click/type/submit/extract actions execute. Workflow Mode treats **Run First Patient** and **Approve & Continue** as the corresponding run-level approvals.
 
 Risk labels:
 
@@ -204,7 +213,7 @@ Risk labels:
 - `caution`: executable action that may change page state, such as typing or ordinary submit.
 - `blocked`: shown with a reason, but not executable.
 
-Before click/type/submit actions run, the extension briefly previews the target by scrolling to it and highlighting it. The preview is visual only; non-blocked actions continue automatically. Use **Stop** to stop before the next action and mark remaining executable actions as stopped.
+Before click/type/submit actions run, the extension briefly previews the target by scrolling to it and highlighting it. It verifies the planned tab, frame, URL, document identity, and target fingerprint before execution. Use **Stop** to stop before the next action and mark remaining executable actions as stopped.
 
 If a selector fails because the page changed or rendered asynchronously, the extension waits through short backoff windows, rereads the page, rematches the target using stable label/text/role evidence, previews the rematched target, and retries the action once. Safety blocks, sensitive fields, disabled controls, and high-risk actions are not retried.
 
@@ -218,7 +227,7 @@ On first run, the side panel explains why the extension requests broad browser p
 - `debugger` is used briefly to request a bounded accessibility tree from the active tab, then detached.
 - `storage` keeps local settings, the last task draft, provider preferences, and action history.
 
-Page text, accessibility context, selected screenshot context, and attachments are sent to the local backend and the selected provider only when you ask a task. API keys and saved side-panel state stay in the local browser/backend setup. The agent blocks password, OTP, card, payment, purchase, transfer, crypto, account deletion, and destructive actions. Non-sensitive requested actions run automatically after planning.
+Page context and attachments are sent to the local backend and selected provider only when you ask a task. API keys, backend pairing tokens, and saved state stay local. The agent blocks password, OTP, card, payment, transfer, crypto, account deletion, and destructive actions. Sensitive workflows add profile-specific minimization and saved cloud-consent controls.
 
 Open the Provider section and click **Permissions & Safety** to view the onboarding explanation again.
 
@@ -234,13 +243,13 @@ The agent should not submit payments, purchases, transfers, crypto actions, acco
 
 Uses `OPENAI_API_KEY` from `.env` or a key saved from the side panel to the local backend.
 
-Ask replies stream token-by-token where supported. Opt-in screenshot context is sent as image input.
+Ask replies return as one schema-validated plan so the displayed reply and actions stay consistent. Opt-in screenshot context is sent as image input.
 
 ### Claude API key
 
 Uses `ANTHROPIC_API_KEY` from `.env` or a key saved from the side panel to the local backend.
 
-Ask replies stream token-by-token where supported. Opt-in screenshot context is sent as image input.
+Ask replies return as one schema-validated plan. Opt-in screenshot context is sent as image input.
 
 ### OpenAI sign-in through Codex CLI
 
@@ -254,13 +263,13 @@ Codex CLI mode emits progress/status events and then a final response. It does n
 
 Uses Ollama's local OpenAI-compatible Chat Completions API at `OLLAMA_BASE_URL`, defaulting to `http://localhost:11434/v1`. Pull the model with `ollama pull deepseek-r1`, then select **DeepSeek-R1 via Ollama** in the side panel or set `RUNTIME_PROVIDER=deepseek_r1_ollama`.
 
-Ask replies stream token-by-token where supported. Screenshot image input is omitted for this text-only provider.
+Ask replies return as one schema-validated plan. Screenshot image input is omitted for this text-only provider.
 
 ### gpt-oss-20b through Ollama
 
 Uses Ollama's local OpenAI-compatible Chat Completions API at `OLLAMA_BASE_URL`, defaulting to `http://localhost:11434/v1`. Pull the model with `ollama pull gpt-oss:20b`, then select **gpt-oss-20b via Ollama** in the side panel or set `RUNTIME_PROVIDER=gpt_oss_20b_ollama`.
 
-Ask replies stream token-by-token where supported. Screenshot image input is omitted for this text-only provider.
+Ask replies return as one schema-validated plan. Screenshot image input is omitted for this text-only provider.
 
 ## Known limitations
 
@@ -293,7 +302,7 @@ npm run dev
 Then check:
 
 ```bash
-curl http://localhost:3000/health
+curl http://127.0.0.1:3000/health
 ```
 
 ### Missing API key
@@ -335,13 +344,13 @@ Chrome shows a debugger permission warning because the extension uses `chrome.de
 
 ### Model returned invalid JSON
 
-The server tries to recover JSON from the model output. If it happens often, implement structured outputs for OpenAI mode and stricter JSON repair for Claude/Codex modes.
+The server validates model JSON against the action schema. OpenAI uses native structured output; other providers use bounded JSON extraction and report invalid plans as warnings.
 
 ### Action failed because the selector changed
 
 The side panel automatically waits briefly, rereads the page, rematches by label/text/role, previews the rematched target, and retries once for selector-like failures. If the action still fails, export **Action History** as Markdown or JSON and inspect the failed entry, rematch note, selector, frame, and page URL.
 
-### Stop an auto-running action batch
+### Stop an approved action batch
 
 Use **Stop** during an action run to stop before the next action. The current browser action may finish if it is already in progress, and remaining executable actions are marked as stopped in Action History.
 

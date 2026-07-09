@@ -3,6 +3,7 @@ const modelInput = document.getElementById("model");
 const baseUrlField = document.getElementById("baseUrlField");
 const baseUrlInput = document.getElementById("baseUrl");
 const apiKeyInput = document.getElementById("apiKey");
+const pairingCodeInput = document.getElementById("pairingCode");
 const saveSettingsBtn = document.getElementById("saveSettingsBtn");
 const settingsStatus = document.getElementById("settingsStatus");
 const backendStatus = document.getElementById("backendStatus");
@@ -33,6 +34,7 @@ const attachmentTray = document.getElementById("attachmentTray");
 const composerState = document.getElementById("composerState");
 const responseBox = document.getElementById("response");
 const actionsBox = document.getElementById("actions");
+const runBatchBtn = document.getElementById("runBatchBtn");
 const collectionTaskInput = document.getElementById("collectionTask");
 const collectionFieldsInput = document.getElementById("collectionFields");
 const collectionPlaybookInput = document.getElementById("collectionPlaybook");
@@ -58,11 +60,24 @@ const metricUrls = document.getElementById("metricUrls");
 const metricElapsed = document.getElementById("metricElapsed");
 const metricCurrentUrl = document.getElementById("metricCurrentUrl");
 const metricLastAction = document.getElementById("metricLastAction");
+const workflowDisclosure = document.getElementById("workflowDisclosure");
+const workflowProfileInput = document.getElementById("workflowProfile");
+const workflowQueueInput = document.getElementById("workflowQueue");
+const workflowCloudConsentInput = document.getElementById("workflowCloudConsent");
+const workflowStartBtn = document.getElementById("workflowStartBtn");
+const workflowStopBtn = document.getElementById("workflowStopBtn");
+const workflowContinueBtn = document.getElementById("workflowContinueBtn");
+const workflowCsvBtn = document.getElementById("workflowCsvBtn");
+const workflowMdBtn = document.getElementById("workflowMdBtn");
+const workflowDeleteBtn = document.getElementById("workflowDeleteBtn");
+const workflowStatus = document.getElementById("workflowStatus");
+const workflowSummary = document.getElementById("workflowSummary");
+const workflowPreview = document.getElementById("workflowPreview");
 const permissionOnboarding = document.getElementById("permissionOnboarding");
 const permissionOnboardingCloseBtn = document.getElementById("permissionOnboardingCloseBtn");
 const permissionOnboardingAckBtn = document.getElementById("permissionOnboardingAckBtn");
 
-const API_BASE = "http://localhost:3000";
+const API_BASE = "http://127.0.0.1:3000";
 const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_BYTES = 512 * 1024;
 const MAX_ATTACHMENT_CHARS = 12000;
@@ -71,6 +86,7 @@ const ACTION_HISTORY_LIMIT = 60;
 const ACTION_HISTORY_STORAGE_KEY = "chromeAiAgentActionHistory";
 const TASK_DRAFT_STORAGE_KEY = "chromeAiAgentTaskDraft";
 const ONBOARDING_ACK_STORAGE_KEY = "chromeAiAgentPermissionOnboardingAck";
+const BACKEND_TOKEN_STORAGE_KEY = "chromeAiAgentBackendToken";
 const ACTION_RETRY_DELAYS_MS = [300, 700, 1500];
 
 let pendingActions = [];
@@ -87,6 +103,12 @@ let batchRunning = false;
 let actionHistory = [];
 let runningActionHistoryId = "";
 let lastTaskDraftSaveTimer = null;
+let backendToken = "";
+let workflowRun = null;
+let workflowStopRequested = false;
+let workflowAbortController = null;
+let workflowEmrTarget = null;
+let workflowActiveTarget = null;
 
 function setBusy(isBusy) {
   document.body.classList.toggle("is-busy", isBusy);
@@ -98,9 +120,10 @@ function setBusy(isBusy) {
   codexCheckBtn.disabled = isBusy;
   attachFileBtn.disabled = isBusy;
   if (baseUrlInput) baseUrlInput.disabled = isBusy;
+  if (pairingCodeInput) pairingCodeInput.disabled = isBusy;
   if (settingsToggleBtn) settingsToggleBtn.disabled = isBusy;
   if (apiKeyToggleBtn) apiKeyToggleBtn.disabled = isBusy;
-  stopBtn.disabled = !isBusy && !collectionRun.running && !batchRunning;
+  stopBtn.disabled = !isBusy && !collectionRun.running && !batchRunning && workflowRun?.status !== "active";
 }
 
 function storageLocal() {
@@ -157,10 +180,18 @@ function actionId() {
 function currentPageReference() {
   const page = latestPageData?.pageData || {};
   const tab = latestPageData?.tab || {};
+  const rawUrl = tab.url || page.url || "";
+
+  try {
+    const url = new URL(rawUrl);
+    return { url: `${url.origin}${url.pathname}`, title: "" };
+  } catch (error) {
+    // Preserve no more than a compact non-query fallback for malformed URLs.
+  }
 
   return {
-    url: tab.url || page.url || "",
-    title: tab.title || page.title || ""
+    url: compactText(rawUrl.split(/[?#]/)[0], 300),
+    title: ""
   };
 }
 
@@ -279,6 +310,10 @@ async function loadActionHistory() {
 
 function addActionHistoryEntry(action, status, patch = {}) {
   const { url, title } = currentPageReference();
+  const retainedAction = {
+    ...action,
+    text: String(action?.type || "").toLowerCase() === "type" && action?.text ? "[redacted]" : action?.text || ""
+  };
   const entry = {
     id: actionId(),
     status,
@@ -286,13 +321,13 @@ function addActionHistoryEntry(action, status, patch = {}) {
     task: compactText(patch.task || taskInput.value, 400),
     url,
     title,
-    summary: actionSummary(action),
+    summary: actionSummary(retainedAction),
     action: {
-      type: action?.type || "",
-      selector: action?.selector || "",
-      text: action?.text || "",
-      frameId: Number.isFinite(action?.frameId) ? action.frameId : 0,
-      shadowPath: Array.isArray(action?.shadowPath) ? action.shadowPath : []
+      type: retainedAction?.type || "",
+      selector: retainedAction?.selector || "",
+      text: retainedAction?.text || "",
+      frameId: Number.isFinite(retainedAction?.frameId) ? retainedAction.frameId : 0,
+      shadowPath: Array.isArray(retainedAction?.shadowPath) ? retainedAction.shadowPath : []
     },
     riskLabel: action?.riskLabel || "",
     riskReasons: Array.isArray(action?.riskReasons) ? action.riskReasons : [],
@@ -1035,8 +1070,10 @@ function renderCollectionRun() {
 async function readCollectionSnapshot() {
   const result = await sendToBackground({
     type: "GET_DEEP_PAGE_CONTEXT",
-    includeScreenshot: includeScreenshotInput.checked,
-    includeAccessibility: true
+    taskId: "collection",
+    contextMode: "light",
+    includeScreenshot: false,
+    includeAccessibility: false
   });
 
   if (result.error) return result;
@@ -1091,10 +1128,10 @@ function collectionActionForDisplay(action, snapshot) {
     ? "caution"
     : normalized.riskLabel;
 
-  return enrichActionForDisplay({
+  return bindActionToSnapshot(enrichActionForDisplay({
     ...normalized,
     riskLabel
-  }, snapshot);
+  }, snapshot), snapshot);
 }
 
 async function executeCollectionActions(tabId, actions, snapshot) {
@@ -1413,6 +1450,10 @@ function stopCurrentWork() {
     setCollectionStatus("Stopping after the current step...");
   }
 
+  if (workflowRun?.status === "active") {
+    stopWorkflowRun("Stopping workflow after the current action...");
+  }
+
   if (batchRunning) {
     actionRunStopRequested = true;
     stopPendingActionHistory("Stopped by user before this action ran.");
@@ -1424,10 +1465,231 @@ function stopCurrentWork() {
   renderActions();
 }
 
+function workflowCurrentRecord() {
+  if (!workflowRun?.records?.length) return null;
+  return workflowRun.records.find(record => record.phase !== "review" && record.phase !== "complete") || workflowRun.records.at(-1);
+}
+
+function setWorkflowStatus(text, tone = "") {
+  setStatusLine(workflowStatus, text, tone);
+}
+
+function workflowFieldValue(record, fieldId) {
+  const field = record?.fields?.[fieldId];
+  return field?.status === "unresolved" || !field ? "" : field.value;
+}
+
+function renderWorkflowPreview() {
+  if (!workflowRun?.records?.length) {
+    workflowPreview.style.display = "none";
+    workflowPreview.textContent = "";
+    return;
+  }
+
+  const fields = ["K", "M", "N", "AF", "AI", "AL", "Y", "CS", "CT", "CN"];
+  const table = document.createElement("table");
+  const header = document.createElement("tr");
+  for (const label of ["MRN", "Surgery", "Phase", ...fields]) {
+    const th = document.createElement("th");
+    th.textContent = label;
+    header.appendChild(th);
+  }
+  const thead = document.createElement("thead");
+  thead.appendChild(header);
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  for (const record of workflowRun.records.slice(-30)) {
+    const tr = document.createElement("tr");
+    for (const value of [record.mrn, record.surgeryDate, record.phase, ...fields.map(field => workflowFieldValue(record, field))]) {
+      const td = document.createElement("td");
+      td.textContent = value === undefined || value === null ? "" : String(value);
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  workflowPreview.textContent = "";
+  workflowPreview.appendChild(table);
+  workflowPreview.style.display = "block";
+}
+
+function renderWorkflowRun() {
+  const hasRun = Boolean(workflowRun?.id);
+  const reviewReady = workflowRun?.status === "awaiting_first_review";
+  const resumable = reviewReady || workflowRun?.status === "stopped";
+  workflowStartBtn.disabled = Boolean(hasRun && workflowRun.status === "active");
+  workflowStopBtn.disabled = !hasRun || workflowRun.status !== "active";
+  workflowContinueBtn.style.display = resumable ? "inline-block" : "none";
+  workflowContinueBtn.disabled = !resumable;
+  workflowContinueBtn.textContent = reviewReady ? "Approve & Continue" : "Resume Run";
+  workflowCsvBtn.disabled = !hasRun;
+  workflowMdBtn.disabled = !hasRun;
+  workflowDeleteBtn.disabled = !hasRun || workflowRun.status === "active";
+
+  if (!hasRun) {
+    workflowSummary.textContent = "Paste MRN,YYYY-MM-DD[,externalId] records to begin.";
+  } else {
+    const active = workflowCurrentRecord();
+    const complete = workflowRun.records.filter(record => record.phase === "review" || record.phase === "complete").length;
+    workflowSummary.textContent = `Run ${workflowRun.id}\nStatus: ${workflowRun.status}\nRecords: ${workflowRun.records.length}; completed/reviewed: ${complete}\nCurrent: ${active ? `${active.id} (${active.phase})` : "none"}`;
+  }
+  renderWorkflowPreview();
+}
+
+async function readWorkflowSnapshot() {
+  if (!workflowRun?.id) return { error: "No workflow run is active." };
+  const result = await sendToBackground({
+    type: "GET_DEEP_PAGE_CONTEXT",
+    taskId: `workflow-${workflowRun.id}`,
+    target: workflowActiveTarget || undefined,
+    contextMode: "light",
+    includeScreenshot: false,
+    includeAccessibility: false
+  });
+
+  if (result.error) return result;
+  latestPageData = { tab: result.tab, pageData: result.page };
+  workflowActiveTarget = result.page.context || result.page.target || workflowActiveTarget;
+  if (!workflowEmrTarget) workflowEmrTarget = workflowActiveTarget;
+  return { tab: result.tab, snapshot: result.page };
+}
+
+function workflowActionWithVariables(action, record, snapshot) {
+  const text = action?.text === "{{MRN}}" ? record.mrn : action?.text;
+  return bindActionToSnapshot({ ...action, text }, snapshot);
+}
+
+async function detectPacsTab() {
+  const tabs = await chrome.tabs.query({ currentWindow: true });
+  const viewer = tabs.find(tab => tab.id !== workflowEmrTarget?.tabId && /(?:xero|pacs|viewer)/i.test(`${tab.title || ""} ${tab.url || ""}`));
+  if (!viewer?.id) return false;
+  workflowActiveTarget = { tabId: viewer.id, frameId: 0, taskId: `workflow-${workflowRun.id}` };
+  setWorkflowStatus("Switched to the report viewer.");
+  return true;
+}
+
+function shouldReturnToEmr(phase) {
+  return ["operations", "medications", "validation"].includes(String(phase || "")) &&
+    workflowEmrTarget?.tabId && workflowActiveTarget?.tabId !== workflowEmrTarget.tabId;
+}
+
+async function executeWorkflowAction(action, record, snapshot) {
+  const bound = workflowActionWithVariables(action, record, snapshot);
+  const execution = await executeActionWithPreviewAndRetry(bound, {
+    collection: true,
+    alertRecovery: true,
+    originalPageData: snapshot,
+    readPageForRetry: readWorkflowSnapshot,
+    shouldStop: () => workflowStopRequested
+  });
+  if (execution.result?.error) throw new Error(execution.result.error);
+  if (execution.stopped || execution.result?.stopped) return false;
+  await sleep(500);
+  await detectPacsTab();
+  return true;
+}
+
+async function stopWorkflowRun(message = "Workflow stopped.") {
+  workflowStopRequested = true;
+  workflowAbortController?.abort();
+  workflowAbortController = null;
+  if (workflowRun?.id) {
+    try {
+      workflowRun = await postJson(`${API_BASE}/workflow-runs/${encodeURIComponent(workflowRun.id)}/stop`, {});
+    } catch (error) {
+      setWorkflowStatus(`Could not persist stop: ${error.message}`, "danger");
+    }
+  }
+  setWorkflowStatus(message, "danger");
+  renderWorkflowRun();
+}
+
+async function runWorkflowLoop() {
+  if (!workflowRun?.id) return;
+  workflowStopRequested = false;
+  setBusy(true);
+  setWorkflowStatus("Running the current patient workflow...");
+  renderWorkflowRun();
+  let noProgress = 0;
+
+  try {
+    while (!workflowStopRequested && workflowRun?.status === "active") {
+      const record = workflowCurrentRecord();
+      if (!record) break;
+      if (shouldReturnToEmr(record.phase)) workflowActiveTarget = workflowEmrTarget;
+
+      const observed = await readWorkflowSnapshot();
+      if (observed.error) throw new Error(observed.error);
+      workflowAbortController = new AbortController();
+      const step = await postJson(
+        `${API_BASE}/workflow-runs/${encodeURIComponent(workflowRun.id)}/records/${encodeURIComponent(record.id)}/plan`,
+        { provider: providerSelect.value, page: observed.snapshot },
+        { signal: workflowAbortController.signal }
+      );
+      workflowAbortController = null;
+      workflowRun = step.run;
+      for (const warning of step.warnings || []) addCollectionLog(`Workflow: ${warning}`);
+      renderWorkflowRun();
+
+      if (workflowRun.status === "awaiting_first_review") {
+        setWorkflowStatus("First complete patient is ready for review.", "success");
+        return;
+      }
+      if (workflowStopRequested) break;
+
+      if (step.actions?.length) {
+        const actionOk = await executeWorkflowAction(step.actions[0], record, observed.snapshot);
+        if (!actionOk) break;
+        noProgress = 0;
+        continue;
+      }
+
+      if (step.done) {
+        setWorkflowStatus(step.validation?.reviewReady ? "Patient is ready for review." : "Patient requires review: validation has blocking errors.", step.validation?.reviewReady ? "success" : "danger");
+        return;
+      }
+
+      noProgress += step.fieldsUpdated?.length ? 0 : 1;
+      if (noProgress >= 3) {
+        setWorkflowStatus("Workflow paused: no safe progress was found after three observations.", "danger");
+        return;
+      }
+    }
+  } catch (error) {
+    if (error.name === "AbortError") {
+      setWorkflowStatus("Workflow stopped.", "danger");
+    } else {
+      setWorkflowStatus(`Workflow paused: ${error.message}`, "danger");
+    }
+  } finally {
+    workflowAbortController = null;
+    setBusy(false);
+    renderWorkflowRun();
+  }
+}
+
+async function downloadWorkflowExport(kind) {
+  if (!workflowRun?.id) return;
+  const response = await fetch(`${API_BASE}/workflow-runs/${encodeURIComponent(workflowRun.id)}/export.${kind}`, {
+    headers: backendToken ? { Authorization: `Bearer ${backendToken}` } : {}
+  });
+  if (!response.ok) throw new Error(`Export failed: ${response.status}`);
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${workflowRun.id}.${kind}`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 function renderActions() {
   if (!pendingActions.length) {
     actionsBox.style.display = "none";
     actionsBox.textContent = "";
+    if (runBatchBtn) runBatchBtn.style.display = "none";
     return;
   }
 
@@ -1489,6 +1751,12 @@ function renderActions() {
     actionsBox.appendChild(div);
   });
 
+  if (runBatchBtn) {
+    runBatchBtn.style.display = runnableCount ? "block" : "none";
+    runBatchBtn.disabled = !runnableCount || batchRunning;
+    runBatchBtn.textContent = `Run ${runnableCount} approved action${runnableCount === 1 ? "" : "s"}`;
+  }
+
 }
 
 async function getActiveTab() {
@@ -1523,8 +1791,10 @@ async function sendToBackground(message) {
 async function readCurrentPage() {
   const result = await sendToBackground({
     type: "GET_DEEP_PAGE_CONTEXT",
+    taskId: "ask",
+    contextMode: includeScreenshotInput.checked ? "deep" : "light",
     includeScreenshot: includeScreenshotInput.checked,
-    includeAccessibility: true
+    includeAccessibility: false
   });
 
   if (result.error) {
@@ -1558,7 +1828,8 @@ async function runPageAction(action, options = {}) {
   return sendToBackground({
     type: "RUN_PAGE_ACTION",
     action,
-    collection: Boolean(options.collection)
+    collection: Boolean(options.collection),
+    alertRecovery: Boolean(options.alertRecovery)
   });
 }
 
@@ -1635,10 +1906,10 @@ async function retryActionAfterRefresh(action, historyId, originalError, origina
       continue;
     }
 
-    const retryAction = enrichActionForDisplay({
+    const retryAction = bindActionToSnapshot(enrichActionForDisplay({
       ...rematched.action,
       historyId
-    }, nextPageData);
+    }, nextPageData), nextPageData);
     const rematchNote = `Retried after ${delayMs}ms with selector ${compactText(retryAction.selector, 120)}.`;
 
     updateActionHistoryEntry(historyId, {
@@ -1691,6 +1962,25 @@ async function retryActionAfterRefresh(action, historyId, originalError, origina
     result: { error: `${originalError} Could not confidently rematch the target after retry backoff.${lastRetryError ? ` Last retry: ${lastRetryError}` : ""}` },
     attempts: 1,
     retried: false
+  };
+}
+
+function snapshotTargetForAction(action, pageData = latestPageData?.pageData) {
+  const frameId = Number.isFinite(action?.frameId) ? action.frameId : 0;
+  const frame = (pageData?.frames || []).find(item => item.frameId === frameId);
+  return frame?.target || pageData?.target || pageData?.context || null;
+}
+
+function bindActionToSnapshot(action, pageData = latestPageData?.pageData) {
+  const element = elementForAction(action, pageData);
+  const target = snapshotTargetForAction(action, pageData);
+  const sourceFrame = (pageData?.accessibleFrames || []).find(item => item.frameId === (Number.isFinite(action?.frameId) ? action.frameId : 0));
+  return {
+    ...action,
+    ...(target ? { target, contextId: target.contextId, taskId: target.taskId } : {}),
+    ...(sourceFrame?.documentIdentity ? { expectedDocumentIdentity: sourceFrame.documentIdentity } : {}),
+    ...(target?.url ? { expectedUrl: target.url } : {}),
+    ...(element?.targetFingerprint ? { targetFingerprint: element.targetFingerprint } : {})
   };
 }
 
@@ -1761,13 +2051,45 @@ function stopPendingActionHistory(reason = "Stopped before this action ran.") {
   pendingActions = remainingActions;
 }
 
-async function postJson(url, body) {
+function backendHeaders() {
+  return {
+    "Content-Type": "application/json",
+    ...(backendToken ? { Authorization: `Bearer ${backendToken}` } : {})
+  };
+}
+
+async function loadBackendToken() {
+  const stored = await storageGet(BACKEND_TOKEN_STORAGE_KEY);
+  backendToken = String(stored[BACKEND_TOKEN_STORAGE_KEY] || "");
+  return backendToken;
+}
+
+async function pairBackend(pairingCode) {
+  const res = await fetch(`${API_BASE}/pair`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      extensionId: chrome.runtime.id,
+      pairingCode: String(pairingCode || "").trim()
+    })
+  });
+  const data = await res.json().catch(() => ({}));
+
+  if (!res.ok || !data.backendToken) {
+    throw new Error(data.error || `Pairing failed: ${res.status}`);
+  }
+
+  backendToken = String(data.backendToken);
+  await storageSet({ [BACKEND_TOKEN_STORAGE_KEY]: backendToken });
+  return data;
+}
+
+async function postJson(url, body, options = {}) {
   const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(body)
+    headers: backendHeaders(),
+    body: JSON.stringify(body),
+    signal: options.signal
   });
 
   const data = await res.json().catch(() => ({}));
@@ -1796,7 +2118,7 @@ function applyAgentFinal(data) {
     ...executable.map(normalizeActionForDisplay),
     ...blocked
   ].map(action => {
-    const enriched = enrichActionForDisplay(action);
+    const enriched = bindActionToSnapshot(enrichActionForDisplay(action));
     const status = enriched.riskLabel === "blocked" ? "blocked" : "proposed";
     const historyId = addActionHistoryEntry(enriched, status);
     return { ...enriched, historyId };
@@ -1853,9 +2175,7 @@ async function streamAgentRequest(payload) {
 
   const res = await fetch(`${API_BASE}/agent/stream`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
+    headers: backendHeaders(),
     body: JSON.stringify(payload),
     signal: activeAbortController.signal
   });
@@ -1898,11 +2218,9 @@ async function streamAgentRequest(payload) {
       } else if (event === "final") {
         sawFinal = true;
         applyAgentFinal(data);
-        const ranActions = await autoRunExecutableActions();
-        if (!ranActions) {
-          setAgentState("Completed", "success");
-          recordActivity("Response completed", "success");
-        }
+        const runnable = executableActions(pendingActions).length;
+        setAgentState(runnable ? "Ready for approval" : "Completed", runnable ? "active" : "success");
+        recordActivity(runnable ? "Action batch awaiting approval" : "Response completed", runnable ? "active" : "success");
       } else if (event === "error") {
         setAgentState("Error", "danger");
         recordActivity(data.error || data.message || "Streaming request failed", "danger");
@@ -1919,7 +2237,7 @@ async function streamAgentRequest(payload) {
 }
 
 async function getJson(url) {
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: backendToken ? { Authorization: `Bearer ${backendToken}` } : {} });
   const data = await res.json().catch(() => ({}));
 
   if (!res.ok) {
@@ -2022,6 +2340,7 @@ function startCodexSigninPolling() {
 
 async function loadSettings() {
   try {
+    await loadBackendToken();
     const data = await getJson(`${API_BASE}/settings`);
     providerSelect.value = data.provider || "openai_api_key";
     modelInput.value = data.model || data.openaiModel || defaultModelForProvider(providerSelect.value);
@@ -2031,13 +2350,14 @@ async function loadSettings() {
     setBackendStatus(true, "Connected");
     setStatusLine(settingsStatus, `Provider: ${providerSelect.value}.`, "success");
     updateProviderTools();
+    await loadResumableWorkflowRun();
   } catch (error) {
     modelInput.value = defaultModelForProvider(providerSelect.value);
     if (baseUrlInput) {
       baseUrlInput.value = defaultBaseUrlForProvider(providerSelect.value);
     }
-    setBackendStatus(false, "Offline");
-    setStatusLine(settingsStatus, "Backend not connected yet.", "danger");
+    setBackendStatus(false, "Pair required");
+    setStatusLine(settingsStatus, "Enter the backend pairing code, then save settings.", "danger");
     providerDisclosure.open = true;
     updateProviderTools();
   }
@@ -2092,6 +2412,11 @@ saveSettingsBtn.addEventListener("click", async () => {
     const apiKey = apiKeyInput.value.trim();
     const baseUrl = baseUrlInput ? baseUrlInput.value.trim() : "";
 
+    if (!backendToken) {
+      await pairBackend(pairingCodeInput?.value);
+      if (pairingCodeInput) pairingCodeInput.value = "";
+    }
+
     const data = await postJson(`${API_BASE}/settings`, {
       provider,
       model,
@@ -2129,7 +2454,7 @@ codexLoginBtn.addEventListener("click", async () => {
     if (data.loginUrl) {
       await chrome.tabs.create({ url: data.loginUrl });
     } else {
-      await chrome.tabs.create({ url: `${API_BASE}/codex-login` });
+      await chrome.tabs.create({ url: `${API_BASE}/codex-login?ticket=${encodeURIComponent(data.loginTicket || "")}` });
     }
 
     startCodexSigninPolling();
@@ -2185,6 +2510,19 @@ if (clearHistoryBtn) {
     event.preventDefault();
     clearActionHistory();
   });
+}
+
+async function loadResumableWorkflowRun() {
+  try {
+    const data = await getJson(`${API_BASE}/workflow-runs`);
+    const candidate = (data.runs || []).find(run => ["active", "awaiting_first_review", "stopped"].includes(run.status));
+    if (!candidate) return;
+    workflowRun = await getJson(`${API_BASE}/workflow-runs/${encodeURIComponent(candidate.id)}`);
+    setWorkflowStatus(`Restored local workflow run ${workflowRun.id}.`, "success");
+    renderWorkflowRun();
+  } catch (error) {
+    // Workflow restoration is optional; normal browsing remains available.
+  }
 }
 
 if (exportHistoryMdBtn) {
@@ -2283,6 +2621,74 @@ collectionApproveBtn.addEventListener("click", () => {
 
 collectionDownloadBtn.addEventListener("click", downloadCollectionMarkdown);
 collectionClearBtn.addEventListener("click", resetCollectionRun);
+
+workflowStartBtn.addEventListener("click", async () => {
+  const queue = workflowQueueInput.value.trim();
+  if (!queue) {
+    setWorkflowStatus("Paste a patient queue first.", "danger");
+    return;
+  }
+
+  setBusy(true);
+  setWorkflowStatus("Creating local workflow run...");
+  try {
+    workflowRun = await postJson(`${API_BASE}/workflow-runs`, {
+      profileId: workflowProfileInput.value,
+      provider: providerSelect.value,
+      queue,
+      saveCloudConsent: workflowCloudConsentInput.checked
+    });
+    workflowEmrTarget = null;
+    workflowActiveTarget = null;
+    workflowDisclosure.open = true;
+    renderWorkflowRun();
+    await runWorkflowLoop();
+  } catch (error) {
+    setWorkflowStatus(error.message, "danger");
+  } finally {
+    setBusy(false);
+    renderWorkflowRun();
+  }
+});
+
+workflowStopBtn.addEventListener("click", () => {
+  stopWorkflowRun("Stopping workflow after the current action...");
+});
+
+workflowContinueBtn.addEventListener("click", async () => {
+  if (!workflowRun?.id) return;
+  try {
+    workflowRun = await postJson(`${API_BASE}/workflow-runs/${encodeURIComponent(workflowRun.id)}/continue`, {});
+    await runWorkflowLoop();
+  } catch (error) {
+    setWorkflowStatus(error.message, "danger");
+  }
+});
+
+workflowCsvBtn.addEventListener("click", () => {
+  downloadWorkflowExport("csv").catch(error => setWorkflowStatus(error.message, "danger"));
+});
+
+workflowMdBtn.addEventListener("click", () => {
+  downloadWorkflowExport("md").catch(error => setWorkflowStatus(error.message, "danger"));
+});
+
+workflowDeleteBtn.addEventListener("click", async () => {
+  if (!workflowRun?.id) return;
+  try {
+    await fetch(`${API_BASE}/workflow-runs/${encodeURIComponent(workflowRun.id)}`, {
+      method: "DELETE",
+      headers: backendToken ? { Authorization: `Bearer ${backendToken}` } : {}
+    });
+    workflowRun = null;
+    workflowEmrTarget = null;
+    workflowActiveTarget = null;
+    setWorkflowStatus("Local workflow run deleted.");
+  } catch (error) {
+    setWorkflowStatus(error.message, "danger");
+  }
+  renderWorkflowRun();
+});
 
 refreshBtn.addEventListener("click", async () => {
   setBusy(true);
@@ -2387,7 +2793,7 @@ async function autoRunExecutableActions() {
   batchRunning = true;
   setBusy(true);
   const runnableCount = executableActions(pendingActions).length;
-  appendResponse(`Auto-running ${runnableCount} non-blocked action${runnableCount === 1 ? "" : "s"}...`);
+  appendResponse(`Running ${runnableCount} approved action${runnableCount === 1 ? "" : "s"}...`);
   setAgentState("Running browser action", "active");
   let runFailed = false;
 
@@ -2483,8 +2889,18 @@ clearBtn.addEventListener("click", () => {
   recordActivity("Cleared current task");
 });
 
+if (runBatchBtn) {
+  runBatchBtn.addEventListener("click", () => {
+    autoRunExecutableActions().catch(error => {
+      appendResponse(`Could not run the action batch: ${error.message}`);
+      setAgentState("Error", "danger");
+    });
+  });
+}
+
 renderAttachments();
 renderCollectionRun();
+renderWorkflowRun();
 loadActionHistory();
 loadTaskDraft();
 loadPermissionOnboarding();

@@ -1,0 +1,26 @@
+{
+  "id": "urolithiasis-v3",
+  "version": "1",
+  "displayName": "Urolithiasis clinical extraction",
+  "dataClassification": "sensitive",
+  "queueFormat": "MRN,YYYY-MM-DD[,externalId]",
+  "mode": "read_only",
+  "cloudPolicy": {
+    "requiresSavedConsent": true,
+    "screenshotsAllowed": false,
+    "fullPageSnapshotsAllowed": false
+  },
+  "phases": [
+    "patient_search",
+    "chartbook",
+    "comorbidities",
+    "laboratory",
+    "radiology",
+    "operations",
+    "medications",
+    "validation",
+    "review"
+  ],
+  "blockedActionWords": ["save", "update", "submit", "delete", "remove", "payment", "transfer"],
+  "dialogPolicy": "alert_only"
+}
