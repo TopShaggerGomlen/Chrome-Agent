@@ -2,6 +2,7 @@
   "id": "urolithiasis-v3",
   "version": "1",
   "displayName": "Urolithiasis clinical extraction",
+  "adapterId": "trakcare-chartbook",
   "dataClassification": "sensitive",
   "queueFormat": "MRN,YYYY-MM-DD[,externalId]",
   "mode": "read_only",
@@ -22,5 +23,21 @@
     "review"
   ],
   "blockedActionWords": ["save", "update", "submit", "delete", "remove", "payment", "transfer"],
-  "dialogPolicy": "alert_only"
+  "dialogPolicy": "alert_only",
+  "phaseFields": {
+    "patient_search": [],
+    "chartbook": [],
+    "comorbidities": ["K", "M", "N", "V", "W"],
+    "laboratory": ["L", "AF", "AI", "AH", "AG", "AD", "AE", "AC", "AB", "AA", "P", "Q"],
+    "radiology": ["BF", "BG", "BH", "AL", "CS", "CT", "CU", "CV", "CW"],
+    "operations": ["S", "T", "CE", "BP", "R", "X", "Y"],
+    "medications": ["BO", "CN", "CO"]
+  },
+  "externalViewer": {
+    "phase": "radiology",
+    "kind": "pacs",
+    "actionTerms": ["pacs", "xero", "viewer", "ct kub", "radiology", "report"],
+    "reportTypeTerms": ["ct", "kub"],
+    "returnToSourcePhases": ["operations", "medications", "validation", "review", "complete"]
+  }
 }

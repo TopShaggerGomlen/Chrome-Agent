@@ -16,6 +16,18 @@ function now() {
 export class WorkflowRunStore {
   constructor({ rootDir = path.resolve(process.cwd(), ".workflow-runs") } = {}) {
     this.rootDir = rootDir;
+    this.locks = new Map();
+  }
+
+  async withLock(runId, operation) {
+    const previous = this.locks.get(runId) ?? Promise.resolve();
+    const current = previous.catch(() => {}).then(operation);
+    this.locks.set(runId, current);
+    try {
+      return await current;
+    } finally {
+      if (this.locks.get(runId) === current) this.locks.delete(runId);
+    }
   }
 
   pathFor(runId) {
@@ -37,8 +49,7 @@ export class WorkflowRunStore {
       createdAt: timestamp,
       updatedAt: timestamp,
     };
-    await this.save(run);
-    return run;
+    return this.save(run);
   }
 
   async load(runId) {
@@ -67,13 +78,30 @@ export class WorkflowRunStore {
 
   async save(run) {
     if (!run?.id) throw new Error("Workflow run ID is required.");
-    const file = this.pathFor(run.id);
-    await mkdir(this.rootDir, { recursive: true });
-    const next = { ...run, updatedAt: now() };
-    const temp = `${file}.${randomUUID()}.tmp`;
-    await writeFile(temp, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-    await rename(temp, file);
-    return next;
+    return this.withLock(run.id, async () => {
+      const file = this.pathFor(run.id);
+      await mkdir(this.rootDir, { recursive: true });
+      let existing = null;
+      try {
+        existing = JSON.parse(await readFile(file, "utf8"));
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      const expectedRevision = Number(run.revision ?? 0);
+      const actualRevision = Number(existing?.revision ?? 0);
+      if (existing && expectedRevision !== actualRevision) {
+        const error = new Error("Workflow run changed while this operation was in progress.");
+        error.code = "STALE_WORKFLOW_RUN";
+        error.expectedRevision = expectedRevision;
+        error.actualRevision = actualRevision;
+        throw error;
+      }
+      const next = { ...run, revision: actualRevision + 1, updatedAt: now() };
+      const temp = `${file}.${randomUUID()}.tmp`;
+      await writeFile(temp, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      await rename(temp, file);
+      return next;
+    });
   }
 
   async appendAudit(runId, event) {
@@ -84,6 +112,6 @@ export class WorkflowRunStore {
   }
 
   async delete(runId) {
-    await rm(this.pathFor(runId), { force: true });
+    await this.withLock(runId, () => rm(this.pathFor(runId), { force: true }));
   }
 }

@@ -2,6 +2,17 @@ const WRITE_WORDS = ["save", "update", "submit", "delete", "remove", "approve", 
 
 export const TRAKCARE_ADAPTER_ID = "trakcare-chartbook";
 
+const PHASE_FIELDS = Object.freeze({
+  patient_search: [],
+  chartbook: [],
+  comorbidities: ["K", "M", "N", "V", "W"],
+  laboratory: ["L", "AF", "AI", "AH", "AG", "AD", "AE", "AC", "AB", "AA", "P", "Q"],
+  radiology: ["BF", "BG", "BH", "AL", "CS", "CT", "CU", "CV", "CW"],
+  operations: ["S", "T", "CE", "BP", "R", "X", "Y"],
+  medications: ["BO", "CN", "CO"],
+  validation: []
+});
+
 export const TRAKCARE_PHASE_HINTS = Object.freeze({
   patient_search: "Open the patient episode search and locate the URN field. Type only {{MRN}}, search, and verify the patient banner before continuing.",
   chartbook: "Open Encounter Record and Chartbook. Confirm the patient banner before collecting data.",
@@ -24,6 +35,13 @@ export function shouldReturnToEmrTab(phase) {
 
 export function trakCarePhaseInstruction(phase) {
   return TRAKCARE_PHASE_HINTS[phase] || "Observe the current read-only page and gather direct evidence only.";
+}
+
+export function trakCarePhaseFieldIds(phase, allFieldIds = []) {
+  const normalized = String(phase || "");
+  if (normalized === "validation") return [...allFieldIds];
+  const selected = PHASE_FIELDS[normalized];
+  return selected ? [...selected] : [...allFieldIds];
 }
 
 export function isTrakCarePhaseTransitionAllowed(currentPhase, nextPhase) {

@@ -5,13 +5,14 @@
   "scripts": {
     "dev": "node index.js",
     "check": "node --check index.js",
-    "test": "node --test *.test.js workflows/*.test.js"
+    "test": "node --test *.test.js workflows/*.test.js workbooks/*.test.js routes/*.test.js schemas/*.test.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.66.0",
     "@openai/codex": "^0.142.5",
     "cors": "^2.8.5",
     "dotenv": "^17.2.0",
+    "exceljs": "^4.4.0",
     "express": "^5.1.0",
     "openai": "^6.0.0"
   }

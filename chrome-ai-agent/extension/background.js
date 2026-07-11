@@ -4,6 +4,8 @@ const SCREENSHOT_QUALITY = 0.72;
 const SCREENSHOT_MAX_BYTES = 900000;
 const CONTEXT_TARGET_TTL_MS = 30 * 60 * 1000;
 const MAX_CONTEXT_TARGETS = 80;
+const VIEWER_LEASE_TTL_MS = 2 * 60 * 1000;
+const MAX_VIEWER_LEASES = 24;
 
 // These limits are enforced in the service worker, so a content-script change
 // cannot accidentally cause an unbounded model payload.
@@ -39,6 +41,10 @@ const CONTEXT_LIMITS = Object.freeze({
 const observedTargets = new Map();
 const lastObservedTargetByTask = new Map();
 const committedDocuments = new Map();
+// External viewers are associated with the action that opened/activated them.
+// A tab is never selected merely because an unrelated, already-open tab has a
+// PACS-looking title.
+const viewerLeases = new Map();
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -59,6 +65,28 @@ chrome.webNavigation.onCommitted.addListener(rememberCommittedDocument);
 chrome.webNavigation.onHistoryStateUpdated.addListener(rememberCommittedDocument);
 chrome.webNavigation.onReferenceFragmentUpdated.addListener(rememberCommittedDocument);
 
+chrome.webNavigation.onCommitted.addListener(details => {
+  noteViewerTabEvent(details?.tabId, "navigation", {
+    url: details?.url,
+    documentId: details?.documentId,
+    frameId: details?.frameId
+  });
+});
+
+chrome.tabs.onCreated.addListener(tab => {
+  noteViewerTabEvent(tab?.id, "created", { tab });
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo?.status || changeInfo?.url || changeInfo?.title) {
+    noteViewerTabEvent(tabId, "updated", { tab, changeInfo });
+  }
+});
+
+chrome.tabs.onActivated.addListener(activeInfo => {
+  noteViewerTabEvent(activeInfo?.tabId, "activated", { windowId: activeInfo?.windowId });
+});
+
 chrome.tabs.onRemoved.addListener(tabId => {
   for (const key of committedDocuments.keys()) {
     if (key.startsWith(`${tabId}:`)) committedDocuments.delete(key);
@@ -66,6 +94,14 @@ chrome.tabs.onRemoved.addListener(tabId => {
 
   for (const [contextId, target] of observedTargets) {
     if (target.tabId === tabId) observedTargets.delete(contextId);
+  }
+
+  for (const lease of viewerLeases.values()) {
+    lease.candidates.delete(tabId);
+    if (lease.viewerTabId === tabId) {
+      lease.status = "lost";
+      lease.error = "The associated viewer tab was closed.";
+    }
   }
 
   trimTargets();
@@ -91,6 +127,37 @@ function tabsGet(tabId) {
       const error = runtimeError();
       if (error) reject(error);
       else resolve(tab);
+    });
+  });
+}
+
+function tabsUpdate(tabId, updateProperties) {
+  return new Promise((resolve, reject) => {
+    chrome.tabs.update(tabId, updateProperties, tab => {
+      const error = runtimeError();
+      if (error) reject(error);
+      else resolve(tab);
+    });
+  });
+}
+
+function tabsRemove(tabId) {
+  return new Promise((resolve, reject) => {
+    chrome.tabs.remove(tabId, () => {
+      const error = runtimeError();
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+function focusWindow(windowId) {
+  if (!Number.isInteger(windowId) || !chrome.windows?.update) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    chrome.windows.update(windowId, { focused: true }, () => {
+      const error = runtimeError();
+      if (error) reject(error);
+      else resolve();
     });
   });
 }
@@ -175,6 +242,358 @@ function getContextLimits(mode) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function newViewerLeaseId() {
+  const suffix = globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `viewer-${suffix}`;
+}
+
+function normalizeViewerExpectation(value) {
+  if (typeof value === "string") {
+    return { kind: value.trim().toLowerCase() || "viewer", urlIncludes: [], titleIncludes: [] };
+  }
+  if (!value || typeof value !== "object") return { kind: "viewer", urlIncludes: [], titleIncludes: [] };
+  return {
+    kind: String(value.kind || value.id || "viewer").trim().toLowerCase(),
+    urlIncludes: Array.isArray(value.urlIncludes)
+      ? value.urlIncludes.map(item => String(item).trim().toLowerCase()).filter(Boolean).slice(0, 12)
+      : [],
+    titleIncludes: Array.isArray(value.titleIncludes)
+      ? value.titleIncludes.map(item => String(item).trim().toLowerCase()).filter(Boolean).slice(0, 12)
+      : []
+  };
+}
+
+function viewerKindTerms(kind) {
+  if (kind === "pacs") return ["pacs", "xero"];
+  if (kind === "xero") return ["xero"];
+  return kind && kind !== "viewer" ? [kind] : ["viewer", "pacs", "xero"];
+}
+
+function viewerCandidateMatches(candidate, expected) {
+  const url = String(candidate.url || candidate.tab?.url || "").toLowerCase();
+  const title = String(candidate.title || candidate.tab?.title || "").toLowerCase();
+  const kindMatch = viewerKindTerms(expected.kind).some(term => url.includes(term) || title.includes(term));
+  const urlMatch = !expected.urlIncludes.length || expected.urlIncludes.some(term => url.includes(term));
+  const titleMatch = !expected.titleIncludes.length || expected.titleIncludes.some(term => title.includes(term));
+  return kindMatch && urlMatch && titleMatch;
+}
+
+function candidateScore(candidate, lease) {
+  let score = 0;
+  if (candidate.openerTabId === lease.sourceTabId) score += 100;
+  if (candidate.ownership === "created") score += 40;
+  if (candidate.events.has("activated")) score += 20;
+  if (candidate.events.has("navigation")) score += 15;
+  if (candidate.events.has("updated")) score += 10;
+  if (candidate.windowId === lease.sourceWindowId) score += 5;
+  if (viewerCandidateMatches(candidate, lease.expectedViewer)) score += 30;
+  return score;
+}
+
+function trimViewerLeases() {
+  const now = Date.now();
+  for (const [leaseId, lease] of viewerLeases) {
+    if (now - lease.createdAtMs > VIEWER_LEASE_TTL_MS) {
+      cleanupExpiredViewerLease(lease).catch(() => {});
+      viewerLeases.delete(leaseId);
+    }
+  }
+  if (viewerLeases.size <= MAX_VIEWER_LEASES) return;
+  const ordered = [...viewerLeases.values()].sort((a, b) => a.createdAtMs - b.createdAtMs);
+  for (const lease of ordered.slice(0, viewerLeases.size - MAX_VIEWER_LEASES)) {
+    cleanupExpiredViewerLease(lease).catch(() => {});
+    viewerLeases.delete(lease.leaseId);
+  }
+}
+
+async function cleanupExpiredViewerLease(lease) {
+  const ownedTabIds = lease.status === "resolved" && lease.ownership === "created"
+    ? [lease.viewerTabId]
+    : [...lease.candidates.values()]
+      .filter(candidate => candidate.ownership === "created" && candidate.openerTabId === lease.sourceTabId)
+      .map(candidate => candidate.tabId);
+  for (const tabId of new Set(ownedTabIds.filter(Number.isInteger))) {
+    try { await tabsRemove(tabId); } catch (_) { /* The tab may already be closed. */ }
+  }
+}
+
+function noteViewerTabEvent(tabId, eventType, details = {}) {
+  if (!Number.isInteger(tabId)) return;
+  const at = Date.now();
+  trimViewerLeases();
+  for (const lease of viewerLeases.values()) {
+    if (lease.status !== "pending" || at < lease.createdAtMs || tabId === lease.sourceTabId) continue;
+
+    const suppliedTab = details.tab;
+    const windowId = suppliedTab?.windowId ?? details.windowId;
+
+    const existedAtStart = lease.existingTabIds.has(tabId);
+    // Reused tabs become eligible only because they were activated or navigated
+    // after BEGIN; an arbitrary update to an old background tab is insufficient.
+    const existing = lease.candidates.get(tabId);
+    if (!existing && existedAtStart && eventType !== "activated" && eventType !== "navigation") continue;
+
+    const candidate = existing || {
+      tabId,
+      ownership: existedAtStart ? "reused" : "created",
+      firstSeenAtMs: at,
+      openerTabId: suppliedTab?.openerTabId,
+      windowId,
+      events: new Set()
+    };
+    candidate.events.add(eventType);
+    candidate.lastSeenAtMs = at;
+    if (suppliedTab) {
+      candidate.tab = suppliedTab;
+      candidate.url = suppliedTab.url || candidate.url;
+      candidate.title = suppliedTab.title || candidate.title;
+      candidate.windowId = suppliedTab.windowId ?? candidate.windowId;
+      candidate.openerTabId = suppliedTab.openerTabId ?? candidate.openerTabId;
+    }
+    if (details.url) candidate.url = details.url;
+    if (details.documentId && (details.frameId === 0 || details.frameId == null)) {
+      candidate.documentId = String(details.documentId);
+    }
+    if (details.changeInfo?.url) candidate.url = details.changeInfo.url;
+    if (details.changeInfo?.title) candidate.title = details.changeInfo.title;
+    lease.candidates.set(tabId, candidate);
+  }
+}
+
+async function beginViewerLease(message) {
+  trimViewerLeases();
+  const sourceTarget = message?.sourceTarget || message?.target || {};
+  if (!Number.isInteger(sourceTarget.tabId)) {
+    return { error: "A source tab is required to begin an external viewer lease.", code: "viewer_source_required" };
+  }
+
+  let sourceTab;
+  try {
+    sourceTab = await tabsGet(sourceTarget.tabId);
+  } catch (error) {
+    return { error: `The source tab is unavailable: ${error.message}`, code: "viewer_source_unavailable" };
+  }
+
+  const frameId = Number.isInteger(sourceTarget.frameId) ? sourceTarget.frameId : 0;
+  const currentSourceDocument = currentDocumentId(sourceTab.id, frameId, { url: sourceTab.url || "" });
+  if (sourceTarget.documentId && currentSourceDocument && sourceTarget.documentId !== currentSourceDocument) {
+    return { error: "The source document changed before the viewer action.", code: "viewer_source_stale" };
+  }
+
+  const existingTabs = await tabsQuery({});
+  const leaseId = newViewerLeaseId();
+  const lease = {
+    leaseId,
+    runId: String(message.runId || "").slice(0, 160),
+    recordId: String(message.recordId || "").slice(0, 160),
+    actionId: String(message.actionId || "").slice(0, 160),
+    sourceTabId: sourceTab.id,
+    sourceWindowId: sourceTab.windowId,
+    sourceTarget: {
+      tabId: sourceTab.id,
+      frameId,
+      url: sourceTarget.url || sourceTab.url || "",
+      documentId: sourceTarget.documentId || currentSourceDocument || ""
+    },
+    expectedViewer: normalizeViewerExpectation(message.expectedViewer),
+    requireVerification: message.requireVerification !== false,
+    existingTabIds: new Set(existingTabs.map(tab => tab.id).filter(Number.isInteger)),
+    candidates: new Map(),
+    createdAtMs: Date.now(),
+    status: "pending"
+  };
+  viewerLeases.set(leaseId, lease);
+  trimViewerLeases();
+  return { ok: true, leaseId, sourceTarget: lease.sourceTarget, expiresInMs: VIEWER_LEASE_TTL_MS };
+}
+
+function publicCandidate(candidate, lease) {
+  return {
+    tabId: candidate.tabId,
+    ownership: candidate.ownership,
+    openerMatched: candidate.openerTabId === lease.sourceTabId,
+    events: [...candidate.events],
+    score: candidateScore(candidate, lease)
+  };
+}
+
+async function hydrateViewerCandidates(lease) {
+  for (const candidate of lease.candidates.values()) {
+    try {
+      const tab = await tabsGet(candidate.tabId);
+      candidate.tab = tab;
+      candidate.url = tab.url || candidate.url;
+      candidate.title = tab.title || candidate.title;
+      candidate.windowId = tab.windowId;
+      candidate.openerTabId = tab.openerTabId ?? candidate.openerTabId;
+    } catch (_) {
+      lease.candidates.delete(candidate.tabId);
+    }
+  }
+}
+
+function normalizedVerificationTerms(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map(item => String(item || "").trim().toLowerCase()).filter(Boolean).slice(0, 12);
+}
+
+function verificationTermMatches(searchable, term) {
+  const escaped = String(term || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!escaped) return false;
+  return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, "i").test(searchable);
+}
+
+async function verifyViewerCandidate(candidate, verification = {}, required = false) {
+  const identityTerms = normalizedVerificationTerms(verification.identityTerms);
+  const reportTerms = normalizedVerificationTerms(verification.reportTerms);
+  if (required && (!identityTerms.length || !reportTerms.length)) {
+    return { ok: false, code: "viewer_verification_required" };
+  }
+  if (!identityTerms.length && !reportTerms.length) {
+    return { ok: true, identityVerified: false, reportVerified: false };
+  }
+
+  try {
+    const frames = await getAllFrames(candidate.tabId);
+    const snapshots = [];
+    for (const frame of (frames.length ? frames : [{ frameId: 0 }]).slice(0, 6)) {
+      try {
+        const snapshot = await tabsSendMessage(candidate.tabId, {
+          type: "GET_PAGE_CONTEXT",
+          snapshotOptions: {
+            snapshotMode: "light",
+            maxElements: 20,
+            maxFormValues: 10,
+            maxChunks: 5,
+            maxTextChars: 5000,
+            maxChunkChars: 1000
+          }
+        }, { frameId: frame.frameId });
+        if (snapshot) snapshots.push(snapshot);
+      } catch (_) {
+        // PACS viewers often contain inaccessible cross-origin utility frames.
+      }
+    }
+    if (!snapshots.length) return { ok: false, code: "viewer_verification_unavailable" };
+    const searchable = snapshots.flatMap(snapshot => [
+      snapshot?.title,
+      snapshot?.text,
+      ...(snapshot?.chunks || []).map(chunk => chunk?.text)
+    ]).filter(Boolean).join("\n").toLowerCase();
+    const missingIdentity = identityTerms.filter(term => !verificationTermMatches(searchable, term));
+    const missingReport = reportTerms.filter(term => !verificationTermMatches(searchable, term));
+    if (missingIdentity.length || missingReport.length) {
+      return { ok: false, code: "viewer_verification_mismatch" };
+    }
+    return {
+      ok: true,
+      identityVerified: identityTerms.length > 0,
+      reportVerified: reportTerms.length > 0
+    };
+  } catch (_) {
+    return { ok: false, code: "viewer_verification_unavailable" };
+  }
+}
+
+async function resolveViewerLease(message) {
+  trimViewerLeases();
+  const lease = viewerLeases.get(String(message?.leaseId || ""));
+  if (!lease) return { error: "Viewer lease was not found or expired.", code: "viewer_lease_missing" };
+  if (lease.status === "resolved") return { ok: true, lease: lease.publicLease };
+  if (lease.status !== "pending") return { error: lease.error || "Viewer lease is not active.", code: "viewer_lease_inactive" };
+
+  const waitMs = Math.max(0, Math.min(Number(message.waitMs) || 0, 15000));
+  if (waitMs) await new Promise(resolve => setTimeout(resolve, waitMs));
+  await hydrateViewerCandidates(lease);
+
+  const matching = [...lease.candidates.values()]
+    .filter(candidate => viewerCandidateMatches(candidate, lease.expectedViewer))
+    .sort((a, b) => candidateScore(b, lease) - candidateScore(a, lease));
+  if (!matching.length) {
+    return {
+      error: "No event-associated external viewer matched the expected application.",
+      code: "viewer_not_associated"
+    };
+  }
+
+  const best = matching[0];
+  const second = matching[1];
+  if (second && candidateScore(best, lease) - candidateScore(second, lease) < 20) {
+    return {
+      error: "More than one external viewer could belong to this action; user review is required.",
+      code: "viewer_ambiguous",
+      candidates: matching.slice(0, 4).map(candidate => publicCandidate(candidate, lease))
+    };
+  }
+
+  const verification = await verifyViewerCandidate(
+    best,
+    message.verification || {},
+    lease.requireVerification
+  );
+  if (!verification.ok) {
+    return {
+      error: "The associated viewer did not pass patient/report verification.",
+      code: verification.code
+    };
+  }
+
+  const documentId = best.documentId || currentDocumentId(best.tabId, 0, { url: best.url || "" });
+  lease.viewerTabId = best.tabId;
+  lease.ownership = best.ownership;
+  lease.status = "resolved";
+  lease.publicLease = {
+    leaseId: lease.leaseId,
+    runId: lease.runId,
+    recordId: lease.recordId,
+    actionId: lease.actionId,
+    sourceTarget: lease.sourceTarget,
+    viewerTarget: { tabId: best.tabId, frameId: 0, url: best.url || "", documentId },
+    ownership: best.ownership,
+    verified: verification.identityVerified && verification.reportVerified,
+    identityVerified: Boolean(verification.identityVerified),
+    reportVerified: Boolean(verification.reportVerified)
+  };
+  return { ok: true, lease: lease.publicLease };
+}
+
+async function releaseViewerLease(message) {
+  trimViewerLeases();
+  const leaseId = String(message?.leaseId || "");
+  const lease = viewerLeases.get(leaseId);
+  if (!lease) return { error: "Viewer lease was not found or expired.", code: "viewer_lease_missing" };
+
+  const result = { ok: true, leaseId, viewerClosed: false, sourceRestored: false };
+  if (message.closeCreated !== false) {
+    const ownedTabIds = lease.status === "resolved" && lease.ownership === "created"
+      ? [lease.viewerTabId]
+      : [...lease.candidates.values()]
+        .filter(candidate => candidate.ownership === "created" && candidate.openerTabId === lease.sourceTabId)
+        .map(candidate => candidate.tabId);
+    for (const tabId of new Set(ownedTabIds.filter(Number.isInteger))) {
+      try {
+        await tabsRemove(tabId);
+        result.viewerClosed = true;
+      } catch (error) {
+        result.closeError = error.message;
+      }
+    }
+  }
+  if (message.restoreSource !== false) {
+    try {
+      await tabsUpdate(lease.sourceTabId, { active: true });
+      await focusWindow(lease.sourceWindowId);
+      result.sourceRestored = true;
+    } catch (error) {
+      result.restoreError = error.message;
+    }
+  }
+  viewerLeases.delete(leaseId);
+  return result;
 }
 
 function newContextId() {
@@ -792,6 +1211,27 @@ async function dismissAlertInTarget(message) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "BEGIN_EXTERNAL_VIEWER_OPEN" || message?.type === "BEGIN_VIEWER_LEASE") {
+    beginViewerLease(message)
+      .then(sendResponse)
+      .catch(error => sendResponse({ error: error.message || "Could not begin viewer tracking.", code: "viewer_begin_failed" }));
+    return true;
+  }
+
+  if (message?.type === "RESOLVE_EXTERNAL_VIEWER" || message?.type === "RESOLVE_VIEWER_LEASE") {
+    resolveViewerLease(message)
+      .then(sendResponse)
+      .catch(error => sendResponse({ error: error.message || "Could not resolve the viewer tab.", code: "viewer_resolve_failed" }));
+    return true;
+  }
+
+  if (message?.type === "RELEASE_EXTERNAL_VIEWER" || message?.type === "RELEASE_VIEWER_LEASE") {
+    releaseViewerLease(message)
+      .then(sendResponse)
+      .catch(error => sendResponse({ error: error.message || "Could not release the viewer tab.", code: "viewer_release_failed" }));
+    return true;
+  }
+
   if (message?.type === "GET_DEEP_PAGE_CONTEXT") {
     collectDeepPageContext({
       taskId: message.taskId,

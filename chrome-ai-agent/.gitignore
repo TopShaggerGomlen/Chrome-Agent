@@ -9,3 +9,12 @@ build/
 *.log
 .workflow-runs/
 server/.workflow-runs/
+**/.workbook-backups/
+**/.workbook-audit/
+**/.workbook-journal/
+**/*.xlsx.lock
+**/*.xlsx.tmp*
+**/*.xlsx.recovery*
+**/*.workbook-lock
+playwright-report/
+test-results/

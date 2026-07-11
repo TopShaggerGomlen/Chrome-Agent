@@ -1,6 +1,5 @@
 import "dotenv/config";
 
-import Anthropic from "@anthropic-ai/sdk";
 import express from "express";
 import fs from "node:fs";
 import path from "node:path";
@@ -8,7 +7,6 @@ import crypto from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import OpenAI from "openai";
 import {
   WorkflowRunStore,
   assertValidPatientQueue,
@@ -23,7 +21,16 @@ import {
   validateUrolithiasisRecord,
   assessUrolithiasisReview
 } from "./workflows/index.js";
-import { isTrakCareReadOnlyAction, isTrakCarePhaseTransitionAllowed, trakCarePhaseInstruction } from "./workflows/trakcare-adapter.js";
+import { WorkflowContextCache, workflowContextKey } from "./workflows/context-cache.js";
+import { assertPhaseFieldAllowed, assertSingleWorkflowAction } from "./workflows/workflow-protocol.js";
+import { assertPromptByteBudget, collectionPlaybookForPrompt } from "./workflows/prompt-policy.js";
+import { applyFirstRecordCheckpoint } from "./workflows/checkpoint.js";
+import { publicWorkflowPolicy, workflowAdapterFor } from "./workflows/workflow-adapters.js";
+import { DiagnosticsRegistry, correlationId } from "./observability.js";
+import { createRuntimeProviderDriver, runtimeProviderMetadata, runtimeProviderStatus } from "./providers/runtime.js";
+import { WorkbookService } from "./workbooks/service.js";
+import { createWorkbookRouter } from "./routes/workbook.js";
+import { AuditStore } from "./workbooks/audit-store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -33,7 +40,35 @@ const RUNTIME_SECRETS_PATH = process.env.RUNTIME_SECRETS_PATH
   ? path.resolve(process.env.RUNTIME_SECRETS_PATH)
   : path.join(__dirname, ".runtime-secrets.json");
 const LOCAL_CODEX_CLI_PATH = path.join(__dirname, "node_modules", "@openai", "codex", "bin", "codex.js");
-const workflowStore = new WorkflowRunStore({ rootDir: path.join(__dirname, ".workflow-runs") });
+const workflowStore = new WorkflowRunStore({ rootDir: process.env.WORKFLOW_RUNS_DIR ? path.resolve(process.env.WORKFLOW_RUNS_DIR) : path.join(__dirname, ".workflow-runs") });
+const workbookAudit = new AuditStore({ directory: process.env.WORKBOOK_AUDIT_DIR ? path.resolve(process.env.WORKBOOK_AUDIT_DIR) : path.join(__dirname, ".workbook-audit") });
+let configuredWorkbookAliases = {};
+try { configuredWorkbookAliases = process.env.WORKBOOK_PATH_ALIASES ? JSON.parse(process.env.WORKBOOK_PATH_ALIASES) : {}; } catch { configuredWorkbookAliases = {}; }
+if (process.env.WORKBOOK_PATH && !configuredWorkbookAliases.main) configuredWorkbookAliases.main = process.env.WORKBOOK_PATH;
+const workbookService = new WorkbookService({
+  runStore: workflowStore,
+  pathAliases: configuredWorkbookAliases,
+  allowedRoots: process.env.WORKBOOK_ALLOWED_ROOTS ? process.env.WORKBOOK_ALLOWED_ROOTS.split(path.delimiter).filter(Boolean) : [],
+  audit: workbookAudit,
+  aliasConfig: undefined
+});
+const workflowContextCache = new WorkflowContextCache();
+const workflowDiagnostics = new DiagnosticsRegistry();
+const workflowPlanControllers = new Map();
+
+function registerWorkflowPlanController(runId, controller) {
+  const controllers = workflowPlanControllers.get(runId) || new Set();
+  controllers.add(controller);
+  workflowPlanControllers.set(runId, controllers);
+  return () => {
+    controllers.delete(controller);
+    if (!controllers.size) workflowPlanControllers.delete(runId);
+  };
+}
+
+function abortWorkflowPlans(runId) {
+  for (const controller of workflowPlanControllers.get(runId) || []) controller.abort();
+}
 
 const PORT = Number(process.env.PORT || 3000);
 const OLLAMA_PROVIDERS = new Set(["deepseek_r1_ollama", "gpt_oss_20b_ollama"]);
@@ -237,12 +272,12 @@ const WORKFLOW_RESPONSE_FORMAT = {
   schema: {
     type: "object",
     additionalProperties: false,
-    required: ["reply", "done", "phase", "actions", "fields", "warnings"],
+    required: ["reply", "done", "phase", "action", "fields", "warnings"],
     properties: {
       reply: JSON_STRING,
       done: { type: "boolean" },
       phase: JSON_STRING,
-      actions: { type: "array", items: COLLECTION_ACTION_SCHEMA },
+      action: { anyOf: [COLLECTION_ACTION_SCHEMA, { type: "null" }] },
       fields: { type: "array", items: WORKFLOW_FIELD_SCHEMA },
       warnings: JSON_STRING_ARRAY
     }
@@ -513,6 +548,7 @@ function localApiGuard(req, res, next) {
 }
 
 app.use(localApiGuard);
+app.use("/workbook", createWorkbookRouter({ workbookService }));
 
 function normalizeProvider(provider) {
   if (provider && PROVIDER_ALIASES.has(provider)) return PROVIDER_ALIASES.get(provider);
@@ -529,7 +565,7 @@ function isOllamaProvider(provider) {
 }
 
 function providerSupportsScreenshot(provider) {
-  return provider === "openai_api_key" || provider === "claude_api_key";
+  return Boolean(runtimeProviderMetadata(provider).capabilities.images);
 }
 
 function screenshotOmittedWarning(provider) {
@@ -545,11 +581,7 @@ function screenshotOmittedWarning(provider) {
 }
 
 function modelForSettings(settings) {
-  if (settings.provider === "claude_api_key") return settings.anthropicModel;
-  if (settings.provider === "openai_signin_codex") return settings.codexModel;
-  if (settings.provider === "deepseek_r1_ollama") return settings.deepseekR1Model;
-  if (settings.provider === "gpt_oss_20b_ollama") return settings.gptOss20bModel;
-  return settings.openaiModel;
+  return runtimeProviderMetadata(settings.provider, settings).model;
 }
 
 function resolveCodexInvocation(commandOverride) {
@@ -615,16 +647,14 @@ function nowIso() {
 }
 
 function workflowProfile(profileId) {
-  if (profileId !== UROLITHIASIS_PROFILE_ID) {
-    throw new Error("Unknown workflow profile.");
-  }
-
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(String(profileId || ""))) throw new Error("Unknown workflow profile.");
   const file = path.join(__dirname, "workflows", "profiles", `${profileId}.json`);
+  if (!fs.existsSync(file)) throw new Error("Unknown workflow profile.");
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
 function providerNeedsWorkflowConsent(provider) {
-  return provider === "openai_api_key" || provider === "claude_api_key" || provider === "openai_signin_codex";
+  return Boolean(runtimeProviderMetadata(provider).capabilities.remoteData);
 }
 
 function workflowConsentKey(profile, settings) {
@@ -1210,7 +1240,7 @@ function buildCollectionPrompt({ task, fields, playbook, limits, runState, page,
     requestedFields: fields,
     limits,
     runState,
-    playbook: runState?.playbookAcknowledged ? "" : safeAttachmentText(playbook || "", 12000),
+    playbook: collectionPlaybookForPrompt(playbook, runState, safeAttachmentText),
     page: {
       url: page?.url,
       title: page?.title,
@@ -1266,6 +1296,8 @@ function cloudSafeWorkflowPage(page, record, redactIdentifiers) {
 }
 
 function buildWorkflowPrompt({ profile, record, page, redactIdentifiers = false }) {
+  const adapter = workflowAdapterFor(profile);
+  const phaseFieldIds = adapter.phaseFieldIds(profile, record.phase, Object.keys(UROLITHIASIS_FIELD_SCHEMA));
   const instructions = [
     "You are the planning and evidence-extraction engine for a read-only browser workflow.",
     "Return only the required JSON object.",
@@ -1275,26 +1307,33 @@ function buildWorkflowPrompt({ profile, record, page, redactIdentifiers = false 
     "Use ISO dates (YYYY-MM-DD), booleans as 0 or 1, and N/A only when the workflow rule explicitly permits it.",
     "When searching for the patient, use the literal text {{MRN}} rather than requesting or reproducing the patient identifier.",
     "Do not infer missing values. When the patient workflow is done, emit an unresolved entry with a concrete reason for every allowed field still lacking evidence.",
-    "Use at most one state-changing browser action per step. After navigation, wait for the next observation instead of batching follow-up clicks.",
-    `Adapter guidance for this phase: ${trakCarePhaseInstruction(record.phase)}`,
+    "Return exactly one browser action in action, or null. After navigation, wait for the next observation instead of batching follow-up clicks.",
+    `Adapter guidance for this phase: ${adapter.phaseInstruction(profile, record.phase)}`,
     `Allowed phases: ${profile.phases.join(", ")}.`,
-    `Allowed field IDs: ${Object.keys(UROLITHIASIS_FIELD_SCHEMA).join(", ")}.`
+    `Field IDs relevant to this phase: ${phaseFieldIds.join(", ")}.`
   ].join("\n");
 
   const safePage = cloudSafeWorkflowPage(page, record, redactIdentifiers);
+  const knownFields = Object.fromEntries(Object.entries(record.fields || {}).filter(([fieldId]) => phaseFieldIds.includes(fieldId)).map(([fieldId, field]) => [fieldId, {
+    status: field?.status || "missing",
+    ...(field?.value !== undefined && field?.value !== "" ? { value: field.value } : {})
+  }]));
   const input = JSON.stringify({
     profile: { id: profile.id, version: profile.version, phase: record.phase, mode: profile.mode },
     patient: { recordId: record.id, surgeryDate: record.surgeryDate },
-    knownFields: record.fields,
+    knownFields,
     page: {
+      contextMode: safePage.contextMode || "full",
       url: safePage.url,
       title: safePage.title,
-      chunks: (safePage.chunks || []).slice(0, 12),
-      elements: (safePage.elements || []).slice(0, 120),
-      formValues: (safePage.formValues || []).slice(0, 40),
+      chunks: (safePage.chunks || []).slice(0, 8),
+      elements: (safePage.elements || []).slice(0, 80),
+      formValues: (safePage.formValues || []).slice(0, 24),
       warnings: safePage.warnings || []
     }
   }, null, 2);
+
+  assertPromptByteBudget(input);
 
   return { instructions, input };
 }
@@ -1315,13 +1354,15 @@ function workflowTypedValue(field, definition) {
   return raw;
 }
 
-function applyWorkflowFieldUpdates(record, fields) {
+function applyWorkflowFieldUpdates(record, fields, allowedFieldIds = Object.keys(UROLITHIASIS_FIELD_SCHEMA)) {
   const updates = [];
+  const allowed = new Set(allowedFieldIds);
 
   for (const field of fields || []) {
     const fieldId = String(field?.fieldId || "");
     const definition = UROLITHIASIS_FIELD_SCHEMA[fieldId];
     if (!definition) throw new Error(`Unknown or disallowed field: ${fieldId || "(empty)"}.`);
+    assertPhaseFieldAllowed(fieldId, record.phase, allowed);
     if (field.status === "unresolved") {
       const note = safeText(field.note || "No direct evidence was found.", 500);
       setRecordField(record, fieldId, {
@@ -1454,183 +1495,11 @@ function validateActions(actions, pageElements, { allowSubmit }) {
   return { validActions, blockedActions };
 }
 
-function dataUrlParts(dataUrl) {
-  const match = String(dataUrl || "").match(/^data:([^;]+);base64,(.+)$/);
-  if (!match) return null;
-  return { mediaType: match[1], base64: match[2] };
-}
-
 function stripReasoningTags(value) {
   return String(value || "")
     .replace(/<think>[\s\S]*?<\/think>/gi, "")
     .replace(/<\|begin_of_thought\|>[\s\S]*?<\|end_of_thought\|>/gi, "")
     .trim();
-}
-
-function createReasoningTagFilter() {
-  let buffer = "";
-  let insideThink = false;
-  const startTag = "<think>";
-  const endTag = "</think>";
-  const keepChars = Math.max(startTag.length, endTag.length) - 1;
-
-  return {
-    push(delta) {
-      buffer += String(delta || "");
-      let output = "";
-
-      while (buffer) {
-        const lower = buffer.toLowerCase();
-
-        if (insideThink) {
-          const endIndex = lower.indexOf(endTag);
-          if (endIndex === -1) {
-            buffer = buffer.slice(-keepChars);
-            break;
-          }
-
-          buffer = buffer.slice(endIndex + endTag.length);
-          insideThink = false;
-          continue;
-        }
-
-        const startIndex = lower.indexOf(startTag);
-        if (startIndex === -1) {
-          const emitLength = Math.max(0, buffer.length - keepChars);
-          output += buffer.slice(0, emitLength);
-          buffer = buffer.slice(emitLength);
-          break;
-        }
-
-        output += buffer.slice(0, startIndex);
-        buffer = buffer.slice(startIndex + startTag.length);
-        insideThink = true;
-      }
-
-      return output;
-    },
-    flush() {
-      const output = insideThink ? "" : buffer;
-      buffer = "";
-      insideThink = false;
-      return output;
-    }
-  };
-}
-
-function openAIInput(input, screenshot) {
-  if (!screenshot?.dataUrl) return input;
-
-  return [
-    {
-      role: "user",
-      content: [
-        { type: "input_text", text: input },
-        { type: "input_image", image_url: screenshot.dataUrl }
-      ]
-    }
-  ];
-}
-
-function claudeContent(input, screenshot) {
-  const parts = [{ type: "text", text: input }];
-  const image = dataUrlParts(screenshot?.dataUrl);
-
-  if (image) {
-    parts.push({
-      type: "image",
-      source: {
-        type: "base64",
-        media_type: screenshot.mediaType || image.mediaType,
-        data: image.base64
-      }
-    });
-  }
-
-  return parts;
-}
-
-async function callOpenAI({ instructions, input, settings, screenshot, responseFormat }) {
-  if (!settings.openaiApiKey) {
-    throw new Error("Missing OpenAI API key. Save it in Provider settings or set OPENAI_API_KEY in server/.env.");
-  }
-
-  const client = new OpenAI({ apiKey: settings.openaiApiKey });
-  const request = {
-    model: settings.openaiModel,
-    instructions,
-    input: openAIInput(input, screenshot)
-  };
-
-  if (responseFormat) {
-    request.text = { format: responseFormat };
-  }
-
-  const response = await client.responses.create(request);
-
-  return response.output_text || "";
-}
-
-async function callClaude({ instructions, input, settings, screenshot }) {
-  if (!settings.anthropicApiKey) {
-    throw new Error("Missing Claude API key. Save it in Provider settings or set ANTHROPIC_API_KEY in server/.env.");
-  }
-
-  const anthropic = new Anthropic({ apiKey: settings.anthropicApiKey });
-
-  const response = await anthropic.messages.create({
-    model: settings.anthropicModel,
-    max_tokens: 1200,
-    system: instructions,
-    messages: [
-      {
-        role: "user",
-        content: claudeContent(input, screenshot)
-      }
-    ]
-  });
-
-  const textBlock = response.content.find(block => block.type === "text");
-  return textBlock?.text || "";
-}
-
-function ollamaClient(settings) {
-  if (!settings.ollamaBaseUrl) {
-    throw new Error("Missing Ollama base URL. Set OLLAMA_BASE_URL in server/.env.");
-  }
-
-  return new OpenAI({
-    apiKey: settings.ollamaApiKey || "ollama",
-    baseURL: settings.ollamaBaseUrl
-  });
-}
-
-function ollamaMessages({ instructions, input, provider }) {
-  if (provider === "deepseek_r1_ollama") {
-    return [
-      {
-        role: "user",
-        content: `${instructions}\n\n${input}`
-      }
-    ];
-  }
-
-  return [
-    { role: "system", content: instructions },
-    { role: "user", content: input }
-  ];
-}
-
-async function callOllamaModel({ provider, instructions, input, settings }) {
-  const client = ollamaClient(settings);
-
-  const response = await client.chat.completions.create({
-    model: settings.ollamaModel,
-    temperature: 0.2,
-    messages: ollamaMessages({ instructions, input, provider })
-  });
-
-  return stripReasoningTags(response.choices?.[0]?.message?.content || "");
 }
 
 async function callOpenAISigninCodex({ instructions, input, settings, signal }) {
@@ -1654,173 +1523,24 @@ async function callOpenAISigninCodex({ instructions, input, settings, signal }) 
   }
 }
 
-async function callSelectedProvider({ provider, instructions, input, settings, screenshot, signal }) {
-  if (provider === "openai_api_key") {
-    return callOpenAI({ instructions, input, settings, screenshot });
-  }
-
-  if (provider === "claude_api_key") {
-    return callClaude({ instructions, input, settings, screenshot });
-  }
-
-  if (provider === "openai_signin_codex") {
-    return callOpenAISigninCodex({ instructions, input, settings, signal });
-  }
-
-  if (isOllamaProvider(provider)) {
-    return callOllamaModel({ provider, instructions, input, settings });
-  }
-
-  throw new Error(`Unsupported provider: ${provider}`);
-}
-
-function isStructuredOutputError(error) {
-  const message = String(error?.message || error || "").toLowerCase();
-
-  return [
-    "json_schema",
-    "structured",
-    "response_format",
-    "text.format",
-    "schema",
-    "unsupported",
-    "unknown parameter",
-    "invalid parameter"
-  ].some(fragment => message.includes(fragment));
-}
-
 async function callSelectedProviderJson({ provider, instructions, input, settings, screenshot, signal, responseFormat }) {
-  if (provider === "openai_api_key" && responseFormat) {
-    try {
-      return {
-        raw: await callOpenAI({ instructions, input, settings, screenshot, responseFormat }),
-        warnings: []
-      };
-    } catch (error) {
-      if (!isStructuredOutputError(error)) throw error;
-
-      return {
-        raw: await callOpenAI({ instructions, input, settings, screenshot }),
-        warnings: [`OpenAI structured output unavailable; used plain JSON fallback. ${safeText(error.message, 220)}`]
-      };
-    }
-  }
-
-  return {
-    raw: await callSelectedProvider({ provider, instructions, input, settings, screenshot, signal }),
-    warnings: []
-  };
-}
-
-function buildReplyPrompt({ task, page, attachedFiles }) {
-  const instructions = [
-    "You are the user-facing voice of a local Chrome browser AI agent.",
-    "Answer naturally and concisely based on the supplied page context.",
-    "If browser actions may be needed, say what you are preparing to do; do not invent selectors or JSON.",
-    "Do not claim that an action has already happened."
-  ].join("\n");
-  const input = JSON.stringify({
-    task,
-    page: {
-      url: page.url,
-      title: page.title,
-      chunks: page.chunks,
-      text: page.text,
-      warnings: page.warnings,
-      screenshot: page.screenshot ? {
-        mediaType: page.screenshot.mediaType,
-        width: page.screenshot.width,
-        height: page.screenshot.height,
-        bytes: page.screenshot.bytes
-      } : null
-    },
-    attachedFiles
-  }, null, 2);
-
-  return { instructions, input };
-}
-
-async function* streamOpenAIReply({ instructions, input, settings, screenshot, signal }) {
-  if (!settings.openaiApiKey) {
-    throw new Error("Missing OpenAI API key. Save it in Provider settings or set OPENAI_API_KEY in server/.env.");
-  }
-
-  const client = new OpenAI({ apiKey: settings.openaiApiKey });
-  const stream = await client.responses.create(
-    {
-      model: settings.openaiModel,
-      instructions,
-      input: openAIInput(input, screenshot),
-      stream: true
-    },
-    { signal }
-  );
-
-  for await (const event of stream) {
-    if (signal?.aborted) throw new Error("Request aborted.");
-
-    if (event.type === "response.output_text.delta" && event.delta) {
-      yield event.delta;
-    } else if (event.type === "response.output_item.delta" && event.delta?.text) {
-      yield event.delta.text;
-    }
-  }
-}
-
-async function* streamClaudeReply({ instructions, input, settings, screenshot, signal }) {
-  if (!settings.anthropicApiKey) {
-    throw new Error("Missing Claude API key. Save it in Provider settings or set ANTHROPIC_API_KEY in server/.env.");
-  }
-
-  const anthropic = new Anthropic({ apiKey: settings.anthropicApiKey });
-  const stream = anthropic.messages.stream({
-    model: settings.anthropicModel,
-    max_tokens: 900,
-    system: instructions,
-    messages: [
-      {
-        role: "user",
-        content: claudeContent(input, screenshot)
-      }
-    ]
+  const driver = createRuntimeProviderDriver(provider, settings, {
+    codexExecutor: ({ prompt, signal: executionSignal }) => callOpenAISigninCodex({
+      instructions: "",
+      input: prompt,
+      settings,
+      signal: executionSignal
+    })
   });
-
-  for await (const event of stream) {
-    if (signal?.aborted) throw new Error("Request aborted.");
-
-    if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
-      yield event.delta.text || "";
-    } else if (event.type === "text") {
-      yield event.text || "";
-    }
-  }
-}
-
-async function* streamOllamaReply({ provider, instructions, input, settings, signal }) {
-  const client = ollamaClient(settings);
-  const reasoningFilter = createReasoningTagFilter();
-  const stream = await client.chat.completions.create(
-    {
-      model: settings.ollamaModel,
-      temperature: 0.2,
-      stream: true,
-      messages: ollamaMessages({ instructions, input, provider })
-    },
-    { signal }
-  );
-
-  for await (const chunk of stream) {
-    if (signal?.aborted) throw new Error("Request aborted.");
-
-    const delta = chunk.choices?.[0]?.delta?.content;
-    const cleanDelta = reasoningFilter.push(delta);
-    if (cleanDelta) yield cleanDelta;
-  }
-
-  const finalDelta = reasoningFilter.flush();
-  if (finalDelta) {
-    yield stripReasoningTags(finalDelta);
-  }
+  const result = await driver.generateJson({
+    instructions,
+    input,
+    screenshot,
+    signal,
+    schema: responseFormat?.schema,
+    schemaName: responseFormat?.name
+  });
+  return { ...result, raw: result.raw || JSON.stringify(result.output), warnings: result.warnings || [] };
 }
 
 function sendSse(res, event, data) {
@@ -1913,6 +1633,7 @@ function runCodexExec({ settings, prompt, outputPath, signal }) {
 }
 
 async function buildAgentFinalResponse({ body, signal }) {
+  const requestCorrelationId = correlationId();
   const { task, provider: requestedProvider, url, title, page: rawPage, files } = body || {};
 
   if (!task || !rawPage) {
@@ -1958,19 +1679,53 @@ async function buildAgentFinalResponse({ body, signal }) {
     allowSubmit
   });
 
-  const providerResult = await callSelectedProviderJson({
+  workflowDiagnostics.record("agent_general", {
+    correlationId: requestCorrelationId,
+    eventType: "provider_request",
+    result: "started",
     provider: settings.provider,
-    instructions,
-    input,
-    settings,
-    screenshot: modelScreenshot,
-    signal,
-    responseFormat: AGENT_RESPONSE_FORMAT
+    model: modelForSettings(settings),
+    contextBytes: Buffer.byteLength(input, "utf8")
   });
+
+  let providerResult;
+  try {
+    providerResult = await callSelectedProviderJson({
+      provider: settings.provider,
+      instructions,
+      input,
+      settings,
+      screenshot: modelScreenshot,
+      signal,
+      responseFormat: AGENT_RESPONSE_FORMAT
+    });
+  } catch (error) {
+    workflowDiagnostics.record("agent_general", {
+      correlationId: requestCorrelationId,
+      eventType: "provider_error",
+      result: signal?.aborted ? "stopped" : "failed",
+      provider: settings.provider,
+      model: modelForSettings(settings),
+      contextBytes: Buffer.byteLength(input, "utf8")
+    });
+    throw error;
+  }
   const raw = providerResult.raw;
   warnings.push(...providerResult.warnings);
+  workflowDiagnostics.record("agent_general", {
+    correlationId: requestCorrelationId,
+    eventType: "provider_response",
+    result: "succeeded",
+    provider: settings.provider,
+    model: providerResult.model,
+    providerRequestId: providerResult.requestId,
+    latencyMs: providerResult.latencyMs,
+    inputTokens: providerResult.usage?.inputTokens,
+    outputTokens: providerResult.usage?.outputTokens,
+    contextBytes: Buffer.byteLength(input, "utf8")
+  });
 
-  const parsed = extractJson(raw);
+  const parsed = providerResult.output && typeof providerResult.output === "object" ? providerResult.output : extractJson(raw);
 
   if (!parsed) {
     return {
@@ -2035,8 +1790,10 @@ function saveRecordAudit(record, type, detail = {}) {
 }
 
 function workflowRunPayload(run) {
+  const profile = workflowProfile(run.profileId);
   return {
     ...run,
+    workflowPolicy: publicWorkflowPolicy(profile),
     records: (run.records || []).map(record => ({
       ...record,
       validation: run.profileId === UROLITHIASIS_PROFILE_ID ? assessUrolithiasisReview(record) : { valid: false, reviewReady: false, errors: [] }
@@ -2045,8 +1802,11 @@ function workflowRunPayload(run) {
 }
 
 app.get("/workflow-profiles", (req, res) => {
-  const profile = workflowProfile(UROLITHIASIS_PROFILE_ID);
-  res.json({ profiles: [profile] });
+  const directory = path.join(__dirname, "workflows", "profiles");
+  const profiles = fs.readdirSync(directory)
+    .filter(name => name.endsWith(".json"))
+    .map(name => workflowProfile(name.slice(0, -5)));
+  res.json({ profiles });
 });
 
 app.post("/workflow-runs", async (req, res) => {
@@ -2054,7 +1814,22 @@ app.post("/workflow-runs", async (req, res) => {
     const profile = workflowProfile(String(req.body?.profileId || UROLITHIASIS_PROFILE_ID));
     const settings = getEffectiveSettings(req.body?.provider);
     const consent = requireWorkflowConsent(profile, settings, Boolean(req.body?.saveCloudConsent));
-    const queue = assertValidPatientQueue(req.body?.queue);
+    let queueInput = req.body?.queue;
+    let workbookMeta = {};
+    if (req.body?.workbookId) {
+      const workbookQueue = await workbookService.patients({ workbookId: req.body.workbookId });
+      // Convert workbook rows into the strict queue format (MRN/date), then
+      // restore workbook identity metadata without passing objects to the
+      // string-only queue parser.
+      const queueLines = workbookQueue.patients.map(p => `${String(p.mrn).trim()},${String(p.surgeryDate).trim()}`).join("\n");
+      const strictQueue = assertValidPatientQueue(queueLines);
+      queueInput = strictQueue.map((item, i) => ({ ...item, patientNumber: workbookQueue.patients[i].patientNumber, row: workbookQueue.patients[i].row }));
+      workbookMeta = { workbookId: req.body.workbookId, workbookFileHash: workbookQueue.fileHash, workbookBound: true };
+    }
+    // Workbook-derived queues are already strictly validated and carry row
+    // identity metadata; the textual queue parser intentionally accepts only
+    // pasted strings, so do not stringify these objects a second time.
+    const queue = req.body?.workbookId ? queueInput : assertValidPatientQueue(queueInput);
     const records = queue.map(item => createWorkflowRecord(item));
     const run = await workflowStore.create({
       profileId: profile.id,
@@ -2065,7 +1840,8 @@ app.post("/workflow-runs", async (req, res) => {
         model: modelForSettings(settings),
         cloudConsentKey: consent.key,
         cloudConsentSaved: consent.saved,
-        dataClassification: profile.dataClassification
+        dataClassification: profile.dataClassification,
+        ...workbookMeta
       }
     });
     res.status(201).json(workflowRunPayload(run));
@@ -2097,12 +1873,14 @@ app.get("/workflow-runs/:runId", async (req, res) => {
 
 app.post("/workflow-runs/:runId/stop", async (req, res) => {
   try {
+    abortWorkflowPlans(req.params.runId);
     const run = await workflowStore.load(req.params.runId);
     run.status = "stopped";
     run.audit = [...(run.audit || []), { at: nowIso(), type: "run_stopped" }];
     res.json(workflowRunPayload(await workflowStore.save(run)));
   } catch (error) {
-    res.status(404).json({ error: "Workflow run was not found." });
+    const status = error?.code === "STALE_WORKFLOW_RUN" ? 409 : 404;
+    res.status(status).json({ error: error.message || "Workflow run was not found.", code: error?.code || "WORKFLOW_RUN_NOT_FOUND" });
   }
 });
 
@@ -2110,15 +1888,19 @@ app.post("/workflow-runs/:runId/continue", async (req, res) => {
   try {
     const run = await workflowStore.load(req.params.runId);
     const firstRecord = run.records?.[0];
-    if (!firstRecord || !["review", "complete"].includes(firstRecord.phase) || !assessUrolithiasisReview(firstRecord).reviewReady) {
+    if (!firstRecord || (!run.metadata?.firstRecordApproved && (!["review", "complete"].includes(firstRecord.phase) || !assessUrolithiasisReview(firstRecord).reviewReady))) {
       return res.status(409).json({ error: "The first patient is not ready for review." });
+    }
+    if (run.metadata?.workbookBound && !run.metadata?.workbookWriteSynced) {
+      return res.status(409).json({ error: "Sync the approved workbook write before continuing.", code: "WORKBOOK_WRITE_REQUIRED" });
     }
     run.status = "active";
     run.metadata = { ...(run.metadata || {}), firstRecordApproved: true };
     run.audit = [...(run.audit || []), { at: nowIso(), type: "first_record_approved" }];
     res.json(workflowRunPayload(await workflowStore.save(run)));
   } catch (error) {
-    res.status(404).json({ error: "Workflow run was not found." });
+    const status = error?.code === "STALE_WORKFLOW_RUN" ? 409 : 404;
+    res.status(status).json({ error: error.message || "Workflow run was not found.", code: error?.code || "WORKFLOW_RUN_NOT_FOUND" });
   }
 });
 
@@ -2151,13 +1933,8 @@ app.post("/workflow-runs/:runId/records/:recordId", async (req, res) => {
     saveRecordAudit(record, "record_updated", { fields: updates.map(update => update.fieldId).filter(Boolean) });
 
     const validation = assessUrolithiasisReview(record);
-    if (validation.reviewReady && record.queueIndex === 0 && !run.metadata?.firstRecordApproved) {
-      record.phase = "review";
-      run.status = "awaiting_first_review";
-      run.audit = [...(run.audit || []), { at: nowIso(), type: "first_record_ready_for_review", recordId: record.id }];
-    } else if (validation.reviewReady && run.metadata?.firstRecordApproved) {
-      record.phase = "complete";
-    }
+    if (validation.reviewReady && record.phase === "collecting") record.phase = "review";
+    applyFirstRecordCheckpoint(run, record, validation.reviewReady, nowIso());
 
     const saved = await workflowStore.save(run);
     res.json({ run: workflowRunPayload(saved), validation });
@@ -2167,6 +1944,14 @@ app.post("/workflow-runs/:runId/records/:recordId", async (req, res) => {
 });
 
 app.post("/workflow-runs/:runId/records/:recordId/plan", async (req, res) => {
+  const requestCorrelationId = correlationId();
+  const startedAt = Date.now();
+  const providerAbortController = new AbortController();
+  req.once("aborted", () => providerAbortController.abort());
+  res.once("close", () => {
+    if (!res.writableEnded) providerAbortController.abort();
+  });
+  const unregisterController = registerWorkflowPlanController(req.params.runId, providerAbortController);
   try {
     const run = await workflowStore.load(req.params.runId);
     if (run.status === "stopped") throw new Error("This workflow run has been stopped.");
@@ -2174,16 +1959,41 @@ app.post("/workflow-runs/:runId/records/:recordId/plan", async (req, res) => {
 
     const record = workflowRecord(run, req.params.recordId);
     const profile = workflowProfile(run.profileId);
+    const adapter = workflowAdapterFor(profile);
     const settings = getEffectiveSettings(req.body?.provider || run.metadata?.provider);
     requireWorkflowConsent(profile, settings, false);
-    const rawPage = req.body?.page;
-    if (!rawPage) throw new Error("A current page snapshot is required.");
-    const page = normalizePage({ ...rawPage, screenshot: null, accessibility: null });
+    const contextKey = workflowContextKey(run.id, record.id);
+    const contextPayload = req.body?.context || (req.body?.page ? { fullPage: req.body.page } : null);
+    if (!contextPayload) throw new Error("A current page snapshot or context delta is required.");
+    const resolvedContext = workflowContextCache.resolve(contextKey, contextPayload);
+    const page = normalizePage({ ...resolvedContext.page, screenshot: null, accessibility: null });
+    const promptPage = normalizePage({ ...resolvedContext.changedPage, screenshot: null, accessibility: null });
+    promptPage.contextMode = resolvedContext.changedPage?.contextMode || "full";
+    workflowDiagnostics.record(run.id, {
+      correlationId: requestCorrelationId,
+      eventType: "context_resolved",
+      result: resolvedContext.cacheHit ? "cache_hit" : "cache_miss",
+      phase: record.phase,
+      recordOrdinal: record.queueIndex,
+      cacheHit: resolvedContext.cacheHit,
+      contextBytes: Buffer.byteLength(JSON.stringify(contextPayload), "utf8")
+    });
     const { instructions, input } = buildWorkflowPrompt({
       profile,
       record,
-      page,
+      page: promptPage,
       redactIdentifiers: providerNeedsWorkflowConsent(settings.provider)
+    });
+    workflowDiagnostics.record(run.id, {
+      correlationId: requestCorrelationId,
+      eventType: "provider_request",
+      result: "started",
+      phase: record.phase,
+      provider: settings.provider,
+      model: modelForSettings(settings),
+      recordOrdinal: record.queueIndex,
+      contextBytes: Buffer.byteLength(input, "utf8"),
+      cacheHit: resolvedContext.cacheHit
     });
     const providerResult = await callSelectedProviderJson({
       provider: settings.provider,
@@ -2191,40 +2001,56 @@ app.post("/workflow-runs/:runId/records/:recordId/plan", async (req, res) => {
       input,
       settings,
       screenshot: null,
+      signal: providerAbortController.signal,
       responseFormat: WORKFLOW_RESPONSE_FORMAT
     });
-    const parsed = extractJson(providerResult.raw);
+    const parsed = providerResult.output && typeof providerResult.output === "object" ? providerResult.output : extractJson(providerResult.raw);
     if (!parsed) throw new Error("The model did not return a valid workflow response.");
+    const proposedAction = assertSingleWorkflowAction(parsed);
 
-    const fieldsUpdated = applyWorkflowFieldUpdates(record, parsed.fields);
+    const phaseFieldIds = adapter.phaseFieldIds(profile, record.phase, Object.keys(UROLITHIASIS_FIELD_SCHEMA));
+    const fieldsUpdated = applyWorkflowFieldUpdates(record, parsed.fields, phaseFieldIds);
     const nextPhase = String(parsed.phase || "");
-    if (profile.phases.includes(nextPhase) && isTrakCarePhaseTransitionAllowed(record.phase, nextPhase)) {
+    if (profile.phases.includes(nextPhase) && adapter.transitionAllowed(profile, record.phase, nextPhase)) {
       record.phase = nextPhase;
     } else if (nextPhase && nextPhase !== record.phase) {
       throw new Error(`Invalid workflow phase transition: ${record.phase} -> ${nextPhase}.`);
     }
     saveRecordAudit(record, "model_workflow_step", { fields: fieldsUpdated, phase: record.phase });
     const validation = assessUrolithiasisReview(record);
-    if (validation.reviewReady && record.queueIndex === 0 && !run.metadata?.firstRecordApproved) {
-      record.phase = "review";
-      run.status = "awaiting_first_review";
-      run.audit = [...(run.audit || []), { at: nowIso(), type: "first_record_ready_for_review", recordId: record.id }];
-    } else if (validation.reviewReady && run.metadata?.firstRecordApproved) {
-      record.phase = "complete";
-    }
+    applyFirstRecordCheckpoint(run, record, validation.reviewReady, nowIso());
+    const actionValidation = validateCollectionActions(proposedAction ? [proposedAction] : [], page);
+    const adapterBlockedActions = actionValidation.validActions.filter(action => !adapter.actionAllowed(profile, action));
+    const adapterAllowedActions = actionValidation.validActions.filter(action => adapter.actionAllowed(profile, action));
     const saved = await workflowStore.save(run);
-    const actionValidation = validateCollectionActions(parsed.actions, page);
-    const adapterBlockedActions = actionValidation.validActions.filter(action => !isTrakCareReadOnlyAction(action));
-    const adapterAllowedActions = actionValidation.validActions.filter(isTrakCareReadOnlyAction);
+    const usage = providerResult.usage || {};
+    workflowDiagnostics.record(run.id, {
+      correlationId: requestCorrelationId,
+      eventType: "provider_response",
+      result: "succeeded",
+      phase: record.phase,
+      provider: settings.provider,
+      model: providerResult.model,
+      providerRequestId: providerResult.requestId,
+      latencyMs: providerResult.latencyMs ?? Date.now() - startedAt,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      contextBytes: Buffer.byteLength(input, "utf8"),
+      recordOrdinal: record.queueIndex,
+      foundFieldCount: Object.values(record.fields || {}).filter(field => field?.status === "found").length,
+      unresolvedFieldCount: Object.values(record.fields || {}).filter(field => field?.status === "unresolved").length,
+      evidenceCoveragePercent: validation.evidenceCoveragePercent,
+      cacheHit: resolvedContext.cacheHit
+    });
 
     res.json({
       reply: safeText(parsed.reply, 2000),
       done: Boolean(parsed.done),
       phase: record.phase,
-      actions: adapterAllowedActions,
+      action: adapterAllowedActions[0] || null,
       blockedActions: [
         ...actionValidation.blockedActions,
-        ...adapterBlockedActions.map(action => ({ action, reason: "The TrakCare adapter allows read-only actions only." }))
+        ...adapterBlockedActions.map(action => ({ action, reason: `The ${adapter.id} adapter blocked this action.` }))
       ],
       fieldsUpdated,
       warnings: [
@@ -2232,11 +2058,51 @@ app.post("/workflow-runs/:runId/records/:recordId/plan", async (req, res) => {
         ...(providerResult.warnings || []),
         ...((actionValidation.blockedActions.length + adapterBlockedActions.length) ? [`${actionValidation.blockedActions.length + adapterBlockedActions.length} action(s) were blocked.`] : [])
       ],
+      correlationId: requestCorrelationId,
+      contextCursor: resolvedContext.cursor,
+      regionHashCount: resolvedContext.regionHashCount,
+      cacheHit: resolvedContext.cacheHit,
       validation,
       run: workflowRunPayload(saved)
     });
   } catch (error) {
-    res.status(error.statusCode || 400).json({ error: error.message || "Could not plan workflow step." });
+    workflowDiagnostics.record(req.params.runId, {
+      correlationId: requestCorrelationId,
+      eventType: "provider_error",
+      result: error?.name === "AbortError" ? "stopped" : "failed",
+      latencyMs: Date.now() - startedAt
+    });
+    const status = error.code === "CONTEXT_BUDGET_EXCEEDED"
+      ? 413
+      : (error.code === "CONTEXT_REFRESH_REQUIRED" || error.code === "STALE_WORKFLOW_RUN" ? 409 : (error.statusCode || 400));
+    res.status(status).json({ error: error.message || "Could not plan workflow step.", code: error.code || "WORKFLOW_PLAN_FAILED", correlationId: requestCorrelationId });
+  } finally {
+    unregisterController();
+  }
+});
+
+app.get("/workflow-runs/:runId/diagnostics", async (req, res) => {
+  try {
+    await workflowStore.load(req.params.runId);
+    res.json(workflowDiagnostics.summary(req.params.runId));
+  } catch {
+    res.status(404).json({ error: "Workflow run was not found." });
+  }
+});
+
+app.post("/workflow-runs/:runId/diagnostics/events", async (req, res) => {
+  try {
+    await workflowStore.load(req.params.runId);
+    res.json({ event: workflowDiagnostics.record(req.params.runId, {
+      eventType: "workflow_action",
+      result: req.body?.result,
+      phase: req.body?.phase,
+      actionType: req.body?.actionType,
+      recordOrdinal: req.body?.recordOrdinal,
+      retryCount: req.body?.retryCount
+    }) });
+  } catch {
+    res.status(404).json({ error: "Workflow run was not found." });
   }
 });
 
@@ -2261,6 +2127,8 @@ app.get("/workflow-runs/:runId/export.md", async (req, res) => {
 app.delete("/workflow-runs/:runId", async (req, res) => {
   try {
     await workflowStore.delete(req.params.runId);
+    workflowContextCache.deleteRun(req.params.runId);
+    workflowDiagnostics.delete(req.params.runId);
     res.json({ ok: true });
   } catch (error) {
     res.status(400).json({ error: error.message || "Could not delete workflow run." });
@@ -2269,6 +2137,14 @@ app.delete("/workflow-runs/:runId", async (req, res) => {
 
 app.get("/health", (req, res) => {
   res.json({ ok: true });
+});
+
+app.get("/providers/status", async (req, res) => {
+  const settings = getEffectiveSettings();
+  const probe = req.query.probe === "true";
+  const codexExecutor = ({ prompt, signal }) => callOpenAISigninCodex({ instructions: "", input: prompt, settings, signal });
+  const providers = await Promise.all([...PROVIDERS].map(provider => runtimeProviderStatus(provider, settings, { codexExecutor, probe })));
+  res.json({ providers });
 });
 
 app.get("/settings", (req, res) => {
@@ -2501,6 +2377,11 @@ app.post("/codex-login/check", async (req, res) => {
 });
 
 app.post("/collection/step", async (req, res) => {
+  const requestCorrelationId = correlationId();
+  const providerAbortController = new AbortController();
+  res.once("close", () => {
+    if (!res.writableEnded) providerAbortController.abort();
+  });
   try {
     const {
       task,
@@ -2554,16 +2435,38 @@ app.post("/collection/step", async (req, res) => {
       attachedFiles
     });
 
+    workflowDiagnostics.record("collection_general", {
+      correlationId: requestCorrelationId,
+      eventType: "provider_request",
+      result: "started",
+      provider: settings.provider,
+      model: modelForSettings(settings),
+      contextBytes: Buffer.byteLength(input, "utf8")
+    });
+
     const providerResult = await callSelectedProviderJson({
       provider: settings.provider,
       instructions,
       input,
       settings,
       screenshot: modelScreenshot,
+      signal: providerAbortController.signal,
       responseFormat: COLLECTION_RESPONSE_FORMAT
     });
+    workflowDiagnostics.record("collection_general", {
+      correlationId: requestCorrelationId,
+      eventType: "provider_response",
+      result: "succeeded",
+      provider: settings.provider,
+      model: providerResult.model,
+      providerRequestId: providerResult.requestId,
+      latencyMs: providerResult.latencyMs,
+      inputTokens: providerResult.usage?.inputTokens,
+      outputTokens: providerResult.usage?.outputTokens,
+      contextBytes: Buffer.byteLength(input, "utf8")
+    });
     const raw = providerResult.raw;
-    const parsed = extractJson(raw);
+    const parsed = providerResult.output && typeof providerResult.output === "object" ? providerResult.output : extractJson(raw);
 
     if (!parsed) {
       return res.json({
@@ -2605,7 +2508,11 @@ app.post("/collection/step", async (req, res) => {
       provider: settings.provider
     });
   } catch (error) {
-    console.error(error);
+    workflowDiagnostics.record("collection_general", {
+      correlationId: requestCorrelationId,
+      eventType: "provider_error",
+      result: providerAbortController.signal.aborted ? "stopped" : "failed"
+    });
 
     return res.status(500).json({
       error: error.message || "Collection step failed."
@@ -2694,11 +2601,13 @@ app.post("/agent/stream", async (req, res) => {
 });
 
 app.post("/agent", async (req, res) => {
+  const abortController = new AbortController();
+  res.once("close", () => {
+    if (!res.writableEnded) abortController.abort();
+  });
   try {
-    return res.json(await buildAgentFinalResponse({ body: req.body || {} }));
+    return res.json(await buildAgentFinalResponse({ body: req.body || {}, signal: abortController.signal }));
   } catch (error) {
-    console.error(error);
-
     return res.status(error.statusCode || 500).json({
       error: error.message || "Agent server failed."
     });
@@ -2711,4 +2620,11 @@ app.listen(PORT, "127.0.0.1", () => {
   if (!secrets.backendToken) {
     console.log(`Pair the extension with this one-time backend code: ${ensurePairingCode()}`);
   }
+});
+
+app.get("/diagnostics/summary", (req, res) => {
+  res.json({
+    agent: workflowDiagnostics.summary("agent_general"),
+    collection: workflowDiagnostics.summary("collection_general")
+  });
 });

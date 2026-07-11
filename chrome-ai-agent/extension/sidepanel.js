@@ -73,6 +73,20 @@ const workflowDeleteBtn = document.getElementById("workflowDeleteBtn");
 const workflowStatus = document.getElementById("workflowStatus");
 const workflowSummary = document.getElementById("workflowSummary");
 const workflowPreview = document.getElementById("workflowPreview");
+const workbookAliasInput = document.getElementById("workbookAlias");
+const workbookPathInput = document.getElementById("workbookPath");
+const workbookStatusBtn = document.getElementById("workbookStatusBtn");
+const workbookOpenBtn = document.getElementById("workbookOpenBtn");
+const workbookState = document.getElementById("workbookState");
+const workbookStatusText = document.getElementById("workbookStatusText");
+const workbookPatientSelect = document.getElementById("workbookPatientSelect");
+const workbookPreview = document.getElementById("workbookPreview");
+const workbookApproveBtn = document.getElementById("workbookApproveBtn");
+const workbookRejectBtn = document.getElementById("workbookRejectBtn");
+const workbookContinueBtn = document.getElementById("workbookContinueBtn");
+const workbookRecovery = document.getElementById("workbookRecovery");
+const workbookRecoveryText = document.getElementById("workbookRecoveryText");
+const workbookRecoverBtn = document.getElementById("workbookRecoverBtn");
 const permissionOnboarding = document.getElementById("permissionOnboarding");
 const permissionOnboardingCloseBtn = document.getElementById("permissionOnboardingCloseBtn");
 const permissionOnboardingAckBtn = document.getElementById("permissionOnboardingAckBtn");
@@ -109,6 +123,11 @@ let workflowStopRequested = false;
 let workflowAbortController = null;
 let workflowEmrTarget = null;
 let workflowActiveTarget = null;
+let workflowViewerLease = null;
+let workbookStateData = null;
+let workbookPatients = [];
+let workbookPreviewData = null;
+const workflowContextStates = new Map();
 
 function setBusy(isBusy) {
   document.body.classList.toggle("is-busy", isBusy);
@@ -1102,6 +1121,7 @@ function collectionRunState() {
     currentUrl: collectionRun.currentUrl,
     currentTitle: collectionRun.currentTitle,
     firstRecordReviewed: collectionRun.firstRecordReviewed,
+    playbookAcknowledged: collectionRun.steps > 0,
     warnings: collectionRun.warnings.slice(-30),
     lastAction: collectionRun.lastAction,
     stopReason: collectionRun.stopReason
@@ -1470,6 +1490,72 @@ function workflowCurrentRecord() {
   return workflowRun.records.find(record => record.phase !== "review" && record.phase !== "complete") || workflowRun.records.at(-1);
 }
 
+function setWorkbookState(text, tone = "offline") {
+  if (workbookState) { workbookState.textContent = text; workbookState.className = `status-pill ${tone === "success" ? "connected" : "offline"}`; }
+}
+
+function renderWorkbookPatients() {
+  if (!workbookPatientSelect) return;
+  workbookPatientSelect.textContent = "";
+  if (!workbookPatients.length) { workbookPatientSelect.disabled = true; const o = document.createElement("option"); o.textContent = "No patients available"; workbookPatientSelect.appendChild(o); return; }
+  workbookPatientSelect.disabled = false;
+  for (const patient of workbookPatients) { const o = document.createElement("option"); o.value = String(patient.patientNumber ?? patient.queueIndex + 1); o.textContent = patient.label || `Patient ${o.value} · ${patient.mrnMasked || "identity protected"} · ${patient.surgeryDate || "date unavailable"}`; workbookPatientSelect.appendChild(o); }
+}
+
+function renderWorkbookPreview(data) {
+  workbookPreviewData = data;
+  if (!workbookPreview) return;
+  workbookPreview.hidden = !data;
+  workbookApproveBtn.hidden = !data || ["conflict", "locked", "sync_pending", "recovery_required"].includes(data.status);
+  workbookRejectBtn.hidden = !data;
+  const synced = data && (data.status === "synced" || (data.status === "written" && (data.sync?.state === "synced" || data.sync?.status === "synced")));
+  workbookContinueBtn.hidden = !synced;
+  if (!data) { workbookPreview.textContent = ""; return; }
+  workbookPreview.textContent = "";
+  const title = document.createElement("strong"); title.textContent = `Patient ${data.patientNumber || ""} · row ${data.row || "?"}`; workbookPreview.appendChild(title);
+  if (data.identity) { const p = document.createElement("p"); p.textContent = `${data.identity.mrnMasked || "Identity protected"} · ${data.identity.surgeryDate || "date unavailable"}`; workbookPreview.appendChild(p); }
+  const warnings = data.warnings || data.validation?.warnings || [];
+  if (warnings.length) { const ul = document.createElement("ul"); ul.className = "workbook-warnings"; for (const warning of warnings) { const li = document.createElement("li"); li.textContent = typeof warning === "string" ? warning : warning.message || warning.code || "Unresolved warning"; ul.appendChild(li); } workbookPreview.appendChild(ul); }
+  const table = document.createElement("table"); const head = document.createElement("tr"); ["Cell", "Before", "Proposed", "Status"].forEach(t => { const th = document.createElement("th"); th.textContent = t; head.appendChild(th); }); table.appendChild(head);
+  for (const diff of data.diff || data.preview?.diff || []) { const tr = document.createElement("tr"); [diff.cell || `${diff.column || ""}${diff.row || ""}`, diff.before ?? "", diff.after ?? diff.proposed ?? "", diff.status || "changed"].forEach(v => { const td = document.createElement("td"); td.textContent = String(v); tr.appendChild(td); }); table.appendChild(tr); }
+  workbookPreview.appendChild(table);
+  const status = data.status || (warnings.length ? "pending_review" : "preview");
+  workbookStatusText.textContent = `Workbook review: ${status}. No write occurs until approval.`;
+  if (["conflict", "locked", "sync_pending", "recovery_required"].includes(status)) { workbookRecovery.hidden = false; workbookRecoveryText.textContent = data.message || `Workbook is ${status}; resolve this state before continuing.`; } else workbookRecovery.hidden = true;
+}
+
+async function checkWorkbookStatus() {
+  const data = await getJson(`${API_BASE}/workbook/status`); workbookStateData = data; setWorkbookState(data.state || "Ready", "success"); workbookStatusText.textContent = data.message || `Workbook ${data.pathAlias || workbookAliasInput?.value || "is ready"}.`; return data;
+}
+
+async function openWorkbook() {
+  const pathAlias = workbookAliasInput?.value.trim();
+  if (!pathAlias) throw new Error("Enter a configured workbook alias. Chrome cannot browse arbitrary filesystem paths.");
+  const data = await postJson(`${API_BASE}/workbook/open`, { pathAlias }); workbookStateData = data; if (workbookPathInput) workbookPathInput.value = "Configured path (hidden by policy)"; workbookPatients = data.queue || data.patients || []; renderWorkbookPatients(); setWorkbookState("Opened", "success"); workbookStatusText.textContent = `${workbookPatients.length} patient(s) loaded. Path alias: ${data.pathAlias || pathAlias}.`; return data;
+}
+
+async function loadWorkbookPatientPreview() {
+  if (!workbookStateData?.workbookId || !workbookPatientSelect?.value) return;
+  const patientNumber = Number(workbookPatientSelect.value); const data = await getJson(`${API_BASE}/workbook/patients/${patientNumber}?workbookId=${encodeURIComponent(workbookStateData.workbookId)}`); renderWorkbookPreview(data);
+}
+
+async function writeWorkbookRecord(record) {
+  if (!workbookStateData?.workbookId || !workflowRun?.id || !record) return null;
+  const patientNumber = Number(record.queueIndex || 0) + 1;
+  const preview = await postJson(`${API_BASE}/workbook/validate-row`, { workbookId: workbookStateData.workbookId, runId: workflowRun.id, patientNumber, record: record.fields || {}, expected: record.workbookExpected || {} });
+  if (["conflict", "locked", "sync_pending", "recovery_required"].includes(preview.status)) throw Object.assign(new Error(preview.message || `Workbook ${preview.status}`), { code: String(preview.status).toUpperCase() });
+  return postJson(`${API_BASE}/workbook/write-row`, {
+    workbookId: workbookStateData.workbookId,
+    runId: workflowRun.id,
+    transactionId: preview.transactionId || actionId(),
+    patientNumber,
+    record: record.fields || {},
+    expected: preview.expected || record.workbookExpected || {},
+    approvalToken: preview.approvalToken || preview.token,
+    diffHash: preview.diffHash
+  });
+}
+
 function setWorkflowStatus(text, tone = "") {
   setStatusLine(workflowStatus, text, tone);
 }
@@ -1536,6 +1622,100 @@ function renderWorkflowRun() {
   renderWorkflowPreview();
 }
 
+function workflowContextKey(record) {
+  return `${workflowRun?.id || ""}:${record?.id || ""}`;
+}
+
+function workflowContextItemKey(item, prefix, index) {
+  if (item?.chunkId) return `chunk:${item.chunkId}`;
+  if (item?.selector) return `target:${item.frameId ?? 0}:${item.selector}:${JSON.stringify(item.shadowPath || [])}`;
+  if (item?.name || item?.label) return `form:${item.frameId ?? 0}:${item.name || item.label}:${index}`;
+  return `${prefix}:${index}`;
+}
+
+function workflowRegionHash(value) {
+  const text = JSON.stringify(value);
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function workflowListRegions(current = [], prefix) {
+  return new Map(current.map((item, index) => {
+    const key = workflowContextItemKey(item, prefix, index);
+    return [key, { item, hash: workflowRegionHash(item) }];
+  }));
+}
+
+function workflowListDelta(previousHashes = {}, current = [], prefix) {
+  const after = workflowListRegions(current, prefix);
+  return {
+    changed: [...after].filter(([key, region]) => previousHashes[key] !== region.hash).map(([key, region]) => ({ ...region.item, contextKey: key })),
+    removed: Object.keys(previousHashes).filter(key => key.startsWith(`${prefix}:`) && !after.has(key)),
+    hashes: Object.fromEntries([...after].map(([key, region]) => [key, region.hash]))
+  };
+}
+
+function buildWorkflowContextRequest(record, snapshot, forceFull = false) {
+  const key = workflowContextKey(record);
+  const state = workflowContextStates.get(key);
+  const documentId = snapshot?.context?.documentId || snapshot?.target?.documentId || "";
+  const previousDocumentId = state?.snapshot?.context?.documentId || state?.snapshot?.target?.documentId || "";
+  const chunks = workflowListDelta(state?.regionHashes, snapshot?.chunks, "chunk");
+  const elements = workflowListDelta(state?.regionHashes, snapshot?.elements, "target");
+  const formValues = workflowListDelta(state?.regionHashes, snapshot?.formValues, "form");
+  const regionHashes = { ...chunks.hashes, ...elements.hashes, ...formValues.hashes };
+  if (forceFull || !state?.cursor || snapshot?.url !== state.snapshot?.url || (documentId && previousDocumentId && documentId !== previousDocumentId)) {
+    return { key, context: { fullPage: snapshot, regionHashes }, snapshot, regionHashes };
+  }
+  return {
+    key,
+    snapshot,
+    regionHashes,
+    context: {
+      cursor: state.cursor,
+      regionHashes,
+      delta: {
+        title: snapshot?.title,
+        timestamp: snapshot?.timestamp,
+        scroll: snapshot?.scroll,
+        warnings: snapshot?.warnings,
+        changedChunks: chunks.changed,
+        removedChunkIds: chunks.removed,
+        changedElements: elements.changed,
+        removedElementIds: elements.removed,
+        changedFormValues: formValues.changed,
+        removedFormValueIds: formValues.removed
+      }
+    }
+  };
+}
+
+function acceptWorkflowContext(request, response) {
+  if (request?.key && response?.contextCursor) {
+    workflowContextStates.set(request.key, { cursor: response.contextCursor, snapshot: request.snapshot, regionHashes: request.regionHashes || {} });
+  }
+}
+
+function shrinkWorkflowSnapshot(snapshot) {
+  const trim = (value, max) => typeof value === "string" ? value.slice(0, max) : value;
+  return {
+    ...snapshot,
+    chunks: (snapshot?.chunks || []).slice(0, 4).map(chunk => ({ ...chunk, text: trim(chunk.text, 1000) })),
+    elements: (snapshot?.elements || []).slice(0, 40).map(element => ({
+      ...element,
+      text: trim(element.text, 240),
+      label: trim(element.label, 240),
+      ariaLabel: trim(element.ariaLabel, 240),
+      placeholder: trim(element.placeholder, 160)
+    })),
+    formValues: (snapshot?.formValues || []).slice(0, 12).map(value => ({ ...value, value: trim(value.value, 500) }))
+  };
+}
+
 async function readWorkflowSnapshot() {
   if (!workflowRun?.id) return { error: "No workflow run is active." };
   const result = await sendToBackground({
@@ -1559,40 +1739,150 @@ function workflowActionWithVariables(action, record, snapshot) {
   return bindActionToSnapshot({ ...action, text }, snapshot);
 }
 
-async function detectPacsTab() {
-  const tabs = await chrome.tabs.query({ currentWindow: true });
-  const viewer = tabs.find(tab => tab.id !== workflowEmrTarget?.tabId && /(?:xero|pacs|viewer)/i.test(`${tab.title || ""} ${tab.url || ""}`));
-  if (!viewer?.id) return false;
-  workflowActiveTarget = { tabId: viewer.id, frameId: 0, taskId: `workflow-${workflowRun.id}` };
-  setWorkflowStatus("Switched to the report viewer.");
+function workflowActionOpensViewer(action, record) {
+  const policy = workflowRun?.workflowPolicy?.externalViewer || {
+    phase: "radiology",
+    actionTerms: ["pacs", "xero", "viewer", "ct kub", "radiology", "report"]
+  };
+  const actionText = [action?.description, action?.text, action?.selector].join(" ").toLowerCase();
+  return record?.phase === policy.phase && action?.type === "click" &&
+    (policy.actionTerms || []).some(term => actionText.includes(String(term).toLowerCase()));
+}
+
+function workflowReportVerificationTerms(action, snapshot) {
+  const element = (snapshot?.elements || []).find(candidate =>
+    candidate.selector === action.selector && Number(candidate.frameId || 0) === Number(action.frameId || 0));
+  const sourceText = [element?.text, element?.label, element?.ariaLabel, element?.title, action.description]
+    .filter(Boolean).join(" ");
+  const dates = sourceText.match(/\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b/g) || [];
+  const identifiers = [...sourceText.matchAll(/(?:accession|study|report)\s*[:#-]?\s*([A-Z0-9-]{4,})/gi)].map(match => match[1]);
+  const specific = [...new Set([...dates, ...identifiers])].slice(0, 3);
+  if (!specific.length) {
+    throw new Error("The selected report control has no visible study date or identifier, so the viewer cannot be safely associated.");
+  }
+  const typeTerms = workflowRun?.workflowPolicy?.externalViewer?.reportTypeTerms || ["ct", "kub"];
+  return [...typeTerms, ...specific];
+}
+
+async function beginWorkflowViewerLease(action, record, snapshot) {
+  const reportTerms = workflowReportVerificationTerms(action, snapshot);
+  const result = await sendToBackground({
+    type: "BEGIN_EXTERNAL_VIEWER_OPEN",
+    runId: workflowRun.id,
+    recordId: record.id,
+    actionId: globalThis.crypto?.randomUUID?.() || `action-${Date.now()}`,
+    sourceTarget: workflowActiveTarget || workflowEmrTarget,
+    expectedViewer: {
+      kind: workflowRun?.workflowPolicy?.externalViewer?.kind || "pacs",
+      urlIncludes: workflowRun?.workflowPolicy?.externalViewer?.urlIncludes || [],
+      titleIncludes: workflowRun?.workflowPolicy?.externalViewer?.titleIncludes || []
+    },
+    requireVerification: true
+  });
+  if (result.error) throw new Error(result.error);
+  workflowViewerLease = { leaseId: result.leaseId, recordId: record.id, mrn: record.mrn, reportTerms };
+}
+
+async function resolveWorkflowViewerLease(record) {
+  if (!workflowViewerLease?.leaseId) return false;
+  const result = await sendToBackground({
+    type: "RESOLVE_EXTERNAL_VIEWER",
+    leaseId: workflowViewerLease.leaseId,
+    waitMs: 1500,
+    verification: { identityTerms: [record.mrn], reportTerms: workflowViewerLease.reportTerms }
+  });
+  if (result.error || !result.lease?.verified) {
+    throw new Error(result.error || "The viewer could not be verified for this patient and report.");
+  }
+  workflowViewerLease = { ...workflowViewerLease, ...result.lease };
+  workflowActiveTarget = { ...result.lease.viewerTarget, taskId: `workflow-${workflowRun.id}` };
+  setWorkflowStatus("Verified and switched to the event-associated report viewer.");
   return true;
 }
 
+async function releaseWorkflowViewerLease() {
+  if (!workflowViewerLease?.leaseId) return;
+  const result = await sendToBackground({
+    type: "RELEASE_EXTERNAL_VIEWER",
+    leaseId: workflowViewerLease.leaseId,
+    closeCreated: true,
+    restoreSource: true
+  });
+  if (result.error) throw new Error(result.error);
+  workflowViewerLease = null;
+  workflowActiveTarget = workflowEmrTarget;
+}
+
 function shouldReturnToEmr(phase) {
-  return ["operations", "medications", "validation"].includes(String(phase || "")) &&
+  const returnPhases = workflowRun?.workflowPolicy?.externalViewer?.returnToSourcePhases || ["operations", "medications", "validation", "review", "complete"];
+  return returnPhases.includes(String(phase || "")) &&
     workflowEmrTarget?.tabId && workflowActiveTarget?.tabId !== workflowEmrTarget.tabId;
 }
 
 async function executeWorkflowAction(action, record, snapshot) {
   const bound = workflowActionWithVariables(action, record, snapshot);
-  const execution = await executeActionWithPreviewAndRetry(bound, {
-    collection: true,
-    alertRecovery: true,
-    originalPageData: snapshot,
-    readPageForRetry: readWorkflowSnapshot,
-    shouldStop: () => workflowStopRequested
-  });
-  if (execution.result?.error) throw new Error(execution.result.error);
-  if (execution.stopped || execution.result?.stopped) return false;
-  await sleep(500);
-  await detectPacsTab();
-  return true;
+  const opensViewer = workflowActionOpensViewer(bound, record);
+  let execution = null;
+  try {
+    if (opensViewer) await beginWorkflowViewerLease(bound, record, snapshot);
+    execution = await executeActionWithPreviewAndRetry(bound, {
+      collection: true,
+      alertRecovery: true,
+      originalPageData: snapshot,
+      readPageForRetry: readWorkflowSnapshot,
+      shouldStop: () => workflowStopRequested
+    });
+    if (execution.result?.error) throw new Error(execution.result.error);
+    if (execution.stopped || execution.result?.stopped) {
+      if (opensViewer && workflowViewerLease) await releaseWorkflowViewerLease();
+      postJson(`${API_BASE}/workflow-runs/${encodeURIComponent(workflowRun.id)}/diagnostics/events`, {
+        eventType: "workflow_action",
+        result: "stopped",
+        phase: record.phase,
+        actionType: bound.type,
+        recordOrdinal: record.queueIndex,
+        retryCount: Math.max(0, Number(execution.attempts || 0) - 1)
+      }).catch(() => {});
+      return false;
+    }
+    await sleep(500);
+    if (opensViewer) await resolveWorkflowViewerLease(record);
+    postJson(`${API_BASE}/workflow-runs/${encodeURIComponent(workflowRun.id)}/diagnostics/events`, {
+      eventType: "workflow_action",
+      result: "succeeded",
+      phase: record.phase,
+      actionType: bound.type,
+      retryCount: Math.max(0, Number(execution.attempts || 0) - 1),
+      recordOrdinal: record.queueIndex
+    }).catch(() => {});
+    return true;
+  } catch (error) {
+    postJson(`${API_BASE}/workflow-runs/${encodeURIComponent(workflowRun.id)}/diagnostics/events`, {
+      eventType: "workflow_action",
+      result: workflowStopRequested ? "stopped" : "failed",
+      phase: record.phase,
+      actionType: bound.type,
+      recordOrdinal: record.queueIndex,
+      retryCount: Math.max(0, Number(execution?.attempts || 0) - 1)
+    }).catch(() => {});
+    if (opensViewer && workflowViewerLease) {
+      try { await releaseWorkflowViewerLease(); } catch (_) { /* Lease expiry is already fail-closed. */ }
+    }
+    throw error;
+  }
 }
 
 async function stopWorkflowRun(message = "Workflow stopped.") {
   workflowStopRequested = true;
   workflowAbortController?.abort();
   workflowAbortController = null;
+  if (workflowViewerLease) {
+    try {
+      await releaseWorkflowViewerLease();
+    } catch (error) {
+      addCollectionLog(`Workflow viewer cleanup: ${error.message}`);
+    }
+  }
   if (workflowRun?.id) {
     try {
       workflowRun = await postJson(`${API_BASE}/workflow-runs/${encodeURIComponent(workflowRun.id)}/stop`, {});
@@ -1616,35 +1906,65 @@ async function runWorkflowLoop() {
     while (!workflowStopRequested && workflowRun?.status === "active") {
       const record = workflowCurrentRecord();
       if (!record) break;
+      if (shouldReturnToEmr(record.phase) && workflowViewerLease) await releaseWorkflowViewerLease();
       if (shouldReturnToEmr(record.phase)) workflowActiveTarget = workflowEmrTarget;
 
       const observed = await readWorkflowSnapshot();
       if (observed.error) throw new Error(observed.error);
       workflowAbortController = new AbortController();
-      const step = await postJson(
-        `${API_BASE}/workflow-runs/${encodeURIComponent(workflowRun.id)}/records/${encodeURIComponent(record.id)}/plan`,
-        { provider: providerSelect.value, page: observed.snapshot },
-        { signal: workflowAbortController.signal }
-      );
+      let contextRequest = buildWorkflowContextRequest(record, observed.snapshot);
+      let step;
+      try {
+        step = await postJson(
+          `${API_BASE}/workflow-runs/${encodeURIComponent(workflowRun.id)}/records/${encodeURIComponent(record.id)}/plan`,
+          { provider: providerSelect.value, context: contextRequest.context },
+          { signal: workflowAbortController.signal }
+        );
+      } catch (error) {
+        if (!["CONTEXT_REFRESH_REQUIRED", "CONTEXT_BUDGET_EXCEEDED"].includes(error.code)) throw error;
+        const retrySnapshot = error.code === "CONTEXT_BUDGET_EXCEEDED"
+          ? shrinkWorkflowSnapshot(observed.snapshot)
+          : observed.snapshot;
+        contextRequest = buildWorkflowContextRequest(record, retrySnapshot, true);
+        step = await postJson(
+          `${API_BASE}/workflow-runs/${encodeURIComponent(workflowRun.id)}/records/${encodeURIComponent(record.id)}/plan`,
+          { provider: providerSelect.value, context: contextRequest.context },
+          { signal: workflowAbortController.signal }
+        );
+      }
       workflowAbortController = null;
+      acceptWorkflowContext(contextRequest, step);
       workflowRun = step.run;
       for (const warning of step.warnings || []) addCollectionLog(`Workflow: ${warning}`);
       renderWorkflowRun();
 
       if (workflowRun.status === "awaiting_first_review") {
+        if (workflowViewerLease) await releaseWorkflowViewerLease();
+        if (workbookStateData?.workbookId) {
+          try {
+            const preview = await postJson(`${API_BASE}/workbook/validate-row`, { workbookId: workbookStateData.workbookId, runId: workflowRun.id, patientNumber: Number(record?.queueIndex || 0) + 1, record: record?.fields || {}, expected: record?.workbookExpected || {} });
+            renderWorkbookPreview(preview);
+          } catch (error) { renderWorkbookPreview({ status: error.code === "WORKBOOK_LOCKED" ? "locked" : error.code === "ROW_CONFLICT" ? "conflict" : "recovery_required", message: error.message, warnings: [error.message] }); }
+        }
         setWorkflowStatus("First complete patient is ready for review.", "success");
         return;
       }
       if (workflowStopRequested) break;
 
-      if (step.actions?.length) {
-        const actionOk = await executeWorkflowAction(step.actions[0], record, observed.snapshot);
+      const stepAction = step.action || null;
+      if (stepAction) {
+        const actionOk = await executeWorkflowAction(stepAction, record, observed.snapshot);
         if (!actionOk) break;
         noProgress = 0;
         continue;
       }
 
       if (step.done) {
+        if (workflowViewerLease) await releaseWorkflowViewerLease();
+        if (workbookStateData?.workbookId && Number(record.queueIndex || 0) > 0) {
+          try { const written = await writeWorkbookRecord(record); setWorkbookState(written?.status === "sync_pending" ? "Sync pending" : "Written", written?.status === "sync_pending" ? "offline" : "success"); }
+          catch (error) { renderWorkbookPreview({ status: error.code === "WORKBOOK_LOCKED" ? "locked" : error.code === "ROW_CONFLICT" ? "conflict" : "recovery_required", message: error.message, warnings: [error.message] }); setWorkflowStatus(`Workbook write paused: ${error.message}`, "danger"); return; }
+        }
         setWorkflowStatus(step.validation?.reviewReady ? "Patient is ready for review." : "Patient requires review: validation has blocking errors.", step.validation?.reviewReady ? "success" : "danger");
         return;
       }
@@ -2087,7 +2407,7 @@ async function pairBackend(pairingCode) {
 async function postJson(url, body, options = {}) {
   const res = await fetch(url, {
     method: "POST",
-    headers: backendHeaders(),
+    headers: { ...backendHeaders(), ...(options.headers || {}) },
     body: JSON.stringify(body),
     signal: options.signal
   });
@@ -2095,7 +2415,11 @@ async function postJson(url, body, options = {}) {
   const data = await res.json().catch(() => ({}));
 
   if (!res.ok) {
-    throw new Error(data.error || data.message || `Request failed: ${res.status}`);
+    const error = new Error(data.error || data.message || `Request failed: ${res.status}`);
+    error.code = data.code || `HTTP_${res.status}`;
+    error.status = res.status;
+    error.correlationId = data.correlationId || "";
+    throw error;
   }
 
   return data;
@@ -2350,6 +2674,7 @@ async function loadSettings() {
     setBackendStatus(true, "Connected");
     setStatusLine(settingsStatus, `Provider: ${providerSelect.value}.`, "success");
     updateProviderTools();
+    await loadWorkflowProfiles();
     await loadResumableWorkflowRun();
   } catch (error) {
     modelInput.value = defaultModelForProvider(providerSelect.value);
@@ -2425,6 +2750,7 @@ saveSettingsBtn.addEventListener("click", async () => {
     });
 
     apiKeyInput.value = "";
+    await loadWorkflowProfiles();
     setBackendStatus(true, "Connected");
     setStatusLine(settingsStatus, `Saved provider: ${data.provider}. ${data.message || ""}`, "success");
   } catch (error) {
@@ -2518,10 +2844,35 @@ async function loadResumableWorkflowRun() {
     const candidate = (data.runs || []).find(run => ["active", "awaiting_first_review", "stopped"].includes(run.status));
     if (!candidate) return;
     workflowRun = await getJson(`${API_BASE}/workflow-runs/${encodeURIComponent(candidate.id)}`);
+    if (workflowRun.workbookId && !workbookStateData) {
+      const alias = workflowRun.pathAlias || workflowRun.workbookAlias || workflowRun.metadata?.pathAlias;
+      if (alias && workbookAliasInput) {
+        workbookAliasInput.value = alias;
+        try { await openWorkbook(); } catch (_) { /* restoration remains available even if workbook is offline */ }
+      }
+    }
     setWorkflowStatus(`Restored local workflow run ${workflowRun.id}.`, "success");
     renderWorkflowRun();
   } catch (error) {
     // Workflow restoration is optional; normal browsing remains available.
+  }
+}
+
+async function loadWorkflowProfiles() {
+  try {
+    const data = await getJson(`${API_BASE}/workflow-profiles`);
+    if (!Array.isArray(data.profiles) || !data.profiles.length) return;
+    const selected = workflowProfileInput.value;
+    workflowProfileInput.textContent = "";
+    for (const profile of data.profiles) {
+      const option = document.createElement("option");
+      option.value = String(profile.id || "");
+      option.textContent = String(profile.displayName || profile.id || "Workflow profile");
+      workflowProfileInput.appendChild(option);
+    }
+    if ([...workflowProfileInput.options].some(option => option.value === selected)) workflowProfileInput.value = selected;
+  } catch (_) {
+    // Keep the packaged default profile when the backend is older or unavailable.
   }
 }
 
@@ -2632,17 +2983,26 @@ workflowStartBtn.addEventListener("click", async () => {
   setBusy(true);
   setWorkflowStatus("Creating local workflow run...");
   try {
+    if (workflowViewerLease) await releaseWorkflowViewerLease();
     workflowRun = await postJson(`${API_BASE}/workflow-runs`, {
       profileId: workflowProfileInput.value,
       provider: providerSelect.value,
-      queue,
+      queue: workbookStateData?.workbookId ? undefined : queue,
+      workbookId: workbookStateData?.workbookId,
+      patientNumber: workbookStateData?.workbookId ? Number(workbookPatientSelect.value || 1) : undefined,
       saveCloudConsent: workflowCloudConsentInput.checked
     });
     workflowEmrTarget = null;
     workflowActiveTarget = null;
+    workflowViewerLease = null;
+    workflowContextStates.clear();
     workflowDisclosure.open = true;
     renderWorkflowRun();
-    await runWorkflowLoop();
+    if (workflowRun.status === "awaiting_first_review" && workbookStateData?.workbookId) {
+      await loadWorkbookPatientPreview();
+    } else {
+      await runWorkflowLoop();
+    }
   } catch (error) {
     setWorkflowStatus(error.message, "danger");
   } finally {
@@ -2676,6 +3036,7 @@ workflowMdBtn.addEventListener("click", () => {
 workflowDeleteBtn.addEventListener("click", async () => {
   if (!workflowRun?.id) return;
   try {
+    if (workflowViewerLease) await releaseWorkflowViewerLease();
     await fetch(`${API_BASE}/workflow-runs/${encodeURIComponent(workflowRun.id)}`, {
       method: "DELETE",
       headers: backendToken ? { Authorization: `Bearer ${backendToken}` } : {}
@@ -2683,11 +3044,46 @@ workflowDeleteBtn.addEventListener("click", async () => {
     workflowRun = null;
     workflowEmrTarget = null;
     workflowActiveTarget = null;
+    workflowViewerLease = null;
+    workflowContextStates.clear();
     setWorkflowStatus("Local workflow run deleted.");
   } catch (error) {
     setWorkflowStatus(error.message, "danger");
   }
   renderWorkflowRun();
+});
+
+workbookStatusBtn?.addEventListener("click", () => checkWorkbookStatus().catch(error => { setWorkbookState("Error"); workbookStatusText.textContent = error.message; }));
+workbookOpenBtn?.addEventListener("click", () => openWorkbook().catch(error => { setWorkbookState("Error"); workbookStatusText.textContent = error.message; }));
+workbookPatientSelect?.addEventListener("change", () => loadWorkbookPatientPreview().catch(error => renderWorkbookPreview({ status: "recovery_required", message: error.message, warnings: [error.message] })));
+workbookApproveBtn?.addEventListener("click", async () => {
+  if (!workbookStateData?.workbookId || !workflowRun?.id || !workbookPreviewData) return;
+  workbookApproveBtn.disabled = true;
+  try {
+    const record = workflowCurrentRecord();
+    const transactionId = workbookPreviewData.transactionId || actionId();
+    const idempotency = actionId();
+    const approval = await postJson(`${API_BASE}/workbook/approve-row`, { workbookId: workbookStateData.workbookId, runId: workflowRun.id, patientNumber: Number(record?.queueIndex || 0) + 1, approvalToken: workbookPreviewData.approvalToken || workbookPreviewData.token, diffHash: workbookPreviewData.diffHash }, { headers: { "Idempotency-Key": idempotency } });
+    const approvalToken = approval.approvalToken || workbookPreviewData.approvalToken || workbookPreviewData.token;
+    const diffHash = approval.diffHash || workbookPreviewData.diffHash;
+    const result = await postJson(`${API_BASE}/workbook/write-row`, { workbookId: workbookStateData.workbookId, runId: workflowRun.id, transactionId, patientNumber: Number(record?.queueIndex || 0) + 1, record: record?.fields || {}, expected: workbookPreviewData.expected || record?.workbookExpected || {}, approvalToken, diffHash }, { headers: { "Idempotency-Key": idempotency } });
+    renderWorkbookPreview(result); if (result.status === "sync_pending") { setWorkbookState("Sync pending"); setWorkflowStatus("Workbook committed; mirror sync is pending recovery.", "danger"); } else if (result.status === "synced" || result.sync?.state === "synced" || result.sync?.status === "synced") { setWorkbookState("Synced", "success"); setWorkflowStatus("Workbook row written and verified. Continue when ready.", "success"); } else { setWorkbookState("Written", "success"); setWorkflowStatus("Workbook row written and verified. Continue when ready.", "success"); }
+  } catch (error) {
+    const code = String(error.code || "");
+    const status = error.status === 423 || code === "WORKBOOK_LOCKED" ? "locked"
+      : error.status === 409 || code === "ROW_CONFLICT" ? "conflict"
+      : "recovery_required";
+    renderWorkbookPreview({ ...workbookPreviewData, status, message: error.message, warnings: [error.message] });
+  } finally { workbookApproveBtn.disabled = false; }
+});
+workbookRejectBtn?.addEventListener("click", () => { workbookStatusText.textContent = "Rejected. Correct the extracted record, then run validation again."; workbookPreview?.focus?.(); });
+workbookContinueBtn?.addEventListener("click", () => workflowContinueBtn.click());
+workbookRecoverBtn?.addEventListener("click", async () => {
+  if (!workbookStateData?.workbookId) return;
+  workbookRecoverBtn.disabled = true;
+  try { const result = await postJson(`${API_BASE}/workbook/recover`, { workbookId: workbookStateData.workbookId, transactionId: workbookPreviewData?.transactionId || null, action: "resume" }, { headers: { "Idempotency-Key": actionId() } }); renderWorkbookPreview(result); setWorkbookState(result.state || "Recovered", "success"); }
+  catch (error) { workbookRecoveryText.textContent = error.message; }
+  finally { workbookRecoverBtn.disabled = false; }
 });
 
 refreshBtn.addEventListener("click", async () => {

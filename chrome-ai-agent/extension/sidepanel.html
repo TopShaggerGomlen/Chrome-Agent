@@ -279,6 +279,23 @@
               <textarea id="workflowQueue" class="collection-playbook" placeholder="MRN,YYYY-MM-DD[,externalId]&#10;One patient per line"></textarea>
             </label>
 
+            <section class="workbook-panel" aria-labelledby="workbookHeading">
+              <div class="section-heading">
+                <div><h3 id="workbookHeading">Workbook</h3><p>Use a configured alias or approved text path. Chrome cannot browse arbitrary files.</p></div>
+                <span id="workbookState" class="status-pill offline" role="status" aria-live="polite">Not configured</span>
+              </div>
+              <div class="form-grid workbook-config">
+                <label class="field" for="workbookAlias"><span>Path alias</span><input id="workbookAlias" autocomplete="off" placeholder="research-workbook" /></label>
+                <label class="field" for="workbookPath"><span>Configured path (display only)</span><input id="workbookPath" autocomplete="off" placeholder="Returned by backend policy" readonly /></label>
+              </div>
+              <div class="button-row"><button id="workbookStatusBtn" class="ghost-button" type="button">Check workbook</button><button id="workbookOpenBtn" class="ghost-button" type="button">Open workbook</button></div>
+              <div id="workbookStatusText" class="status-line">Workbook is optional; pasted queue mode remains available.</div>
+              <label class="field" for="workbookPatientSelect"><span>Workbook patient queue</span><select id="workbookPatientSelect" disabled><option value="">Open a workbook to load patients</option></select></label>
+              <div id="workbookPreview" class="workbook-preview" hidden></div>
+              <div class="button-row workbook-review-actions"><button id="workbookRejectBtn" class="ghost-button" type="button" hidden>Reject / correct</button><button id="workbookApproveBtn" class="primary-button" type="button" hidden>Approve and write</button><button id="workbookContinueBtn" class="ghost-button" type="button" hidden>Write complete — continue</button></div>
+              <div id="workbookRecovery" class="status-line" role="alert" hidden><span id="workbookRecoveryText"></span> <button id="workbookRecoverBtn" class="ghost-button compact-button" type="button">Attempt recovery</button></div>
+            </section>
+
             <label class="checkbox-line" for="workflowCloudConsent">
               <input id="workflowCloudConsent" type="checkbox" />
               <span>Save approval for this workflow/provider to send minimized, de-identified evidence to the selected cloud provider.</span>

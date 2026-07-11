@@ -24,6 +24,21 @@ import {
   validateRecord,
   validateUrolithiasisRecord,
 } from "./index.js";
+import { applyFirstRecordCheckpoint } from "./checkpoint.js";
+
+test("first-record checkpoint blocks the queue until explicit approval", () => {
+  const run = { status: "active", metadata: {}, audit: [] };
+  const first = { id: "first", queueIndex: 0, phase: "validation" };
+  const second = { id: "second", queueIndex: 1, phase: "validation" };
+  assert.deepEqual(applyFirstRecordCheckpoint(run, first, true, "2026-01-01T00:00:00.000Z"), { checkpointed: true, completed: false });
+  assert.equal(run.status, "awaiting_first_review");
+  assert.equal(first.phase, "review");
+  assert.equal(second.phase, "validation");
+  run.metadata.firstRecordApproved = true;
+  run.status = "active";
+  assert.deepEqual(applyFirstRecordCheckpoint(run, second, true), { checkpointed: false, completed: true });
+  assert.equal(second.phase, "complete");
+});
 
 const evidence = [createEvidence({ source: "TrakCare Laboratory", sourceDate: "2026-01-01", reference: "Lab 123" })];
 
@@ -102,6 +117,17 @@ test("review readiness keeps unresolved fields visible without hiding determinis
   assert.equal(assessUrolithiasisReview(record).reviewReady, false);
 });
 
+test("review assessment reports field evidence coverage for PHI-safe diagnostics", () => {
+  const record = createWorkflowRecord({ id: "record_coverage", mrn: "123", surgeryDate: "2026-01-10" });
+  setRecordField(record, "K", { status: FieldStatus.FOUND, type: "boolean", value: 1, evidence });
+  setRecordField(record, "M", { status: FieldStatus.FOUND, type: "boolean", value: 0, evidence: [] });
+  setRecordField(record, "N", { status: FieldStatus.UNRESOLVED, type: "boolean", note: "Not visible." });
+  const assessment = assessUrolithiasisReview(record);
+  assert.equal(assessment.foundFieldCount, 2);
+  assert.equal(assessment.unresolvedFieldCount, 1);
+  assert.equal(assessment.evidenceCoveragePercent, 50);
+});
+
 test("run store persists atomically and exporters preserve audit provenance", async () => {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "workflow-store-"));
   try {
@@ -113,6 +139,14 @@ test("run store persists atomically and exporters preserve audit provenance", as
     assert.equal(saved.audit.at(-1).type, "first_patient_reviewed");
     assert.equal((await store.load("run_test")).records[0].mrn, "123,45");
     assert.equal((await store.list()).length, 1);
+
+    const firstPlannerCopy = await store.load("run_test");
+    const stopCopy = await store.load("run_test");
+    stopCopy.status = "stopped";
+    await store.save(stopCopy);
+    firstPlannerCopy.status = "active";
+    await assert.rejects(() => store.save(firstPlannerCopy), error => error?.code === "STALE_WORKFLOW_RUN");
+    assert.equal((await store.load("run_test")).status, "stopped");
 
     const csv = exportRunToCsv(saved, { fieldSchema: { K: UROLITHIASIS_FIELD_SCHEMA.K } });
     assert.match(csv, /"123,45"/);

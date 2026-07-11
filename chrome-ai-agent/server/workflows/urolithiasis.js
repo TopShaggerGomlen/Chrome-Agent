@@ -133,12 +133,17 @@ export function assessUrolithiasisReview(record) {
   const blockingErrors = validation.errors.filter(error =>
     !/Required field is (missing|unresolved)\./.test(error.message)
   );
+  const foundFields = Object.values(record.fields || {}).filter(field => field?.status === FieldStatus.FOUND);
+  const evidencedFields = foundFields.filter(field => Array.isArray(field.evidence) && field.evidence.length > 0);
 
   return {
     ...validation,
     reviewReady: missing.length === 0 && blockingErrors.length === 0,
     blockingErrors,
     missing,
-    unresolved
+    unresolved,
+    foundFieldCount: foundFields.length,
+    unresolvedFieldCount: unresolved.length,
+    evidenceCoveragePercent: foundFields.length ? Math.round((evidencedFields.length / foundFields.length) * 100) : 0
   };
 }
