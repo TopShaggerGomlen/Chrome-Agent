@@ -6,7 +6,7 @@
   "minimum_chrome_version": "116",
   "permissions": [
     "activeTab",
-    "scripting",
+    "debugger",
     "sidePanel",
     "tabs"
   ],
@@ -22,12 +22,5 @@
   },
   "action": {
     "default_title": "Open AI Agent"
-  },
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "run_at": "document_idle"
-    }
-  ]
+  }
 }

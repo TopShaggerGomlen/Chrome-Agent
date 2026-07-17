@@ -1,5 +1,7 @@
 # Chrome AI Agent Build Spec for Codex
 
+> **Current architecture override:** The implemented agent is screenshot-only and has no task approval gate. It captures the visible tab with the Chrome debugger protocol, sends the PNG to a vision-capable provider, and executes validated coordinate actions automatically. The older permission-gate, content-script, DOM snapshot, selector, and multi-action examples below are historical and must not be used as the implementation source of truth.
+
 This Markdown file is a full build brief for **Codex**. Save it as `BUILD_SPEC.md` inside a new project folder and ask Codex to create the project.
 
 The goal is to build a local Chrome browser AI agent similar in concept to a side-panel browser assistant: it can read the current page, reason about the page, and perform page actions such as clicking, typing, extracting, and submitting forms.

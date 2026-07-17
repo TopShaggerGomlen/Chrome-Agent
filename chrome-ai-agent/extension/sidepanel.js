@@ -13,7 +13,6 @@ const providerDisclosure = document.getElementById("providerDisclosure");
 const taskInput = document.getElementById("task");
 const askBtn = document.getElementById("askBtn");
 const refreshBtn = document.getElementById("refreshBtn");
-const runBatchBtn = document.getElementById("runBatchBtn");
 const clearBtn = document.getElementById("clearBtn");
 const attachFileBtn = document.getElementById("attachFileBtn");
 const fileInput = document.getElementById("fileInput");
@@ -55,7 +54,7 @@ const MAX_TOTAL_ATTACHMENT_CHARS = 30000;
 let pendingActions = [];
 let executedActions = [];
 let latestPageData = null;
-let taskPermissionGranted = false;
+let activeTask = "";
 let codexSigninPollTimer = null;
 let attachedFiles = [];
 let nextAttachmentId = 1;
@@ -67,7 +66,6 @@ function setBusy(isBusy) {
   document.body.setAttribute("aria-busy", String(isBusy));
   askBtn.disabled = isBusy;
   refreshBtn.disabled = isBusy;
-  runBatchBtn.disabled = isBusy;
   saveSettingsBtn.disabled = isBusy;
   codexLoginBtn.disabled = isBusy;
   codexCheckBtn.disabled = isBusy;
@@ -409,21 +407,16 @@ async function readCollectionSnapshot() {
     return { error: "No active tab found." };
   }
 
-  const snapshot = await sendToContentScript(tab.id, {
-    type: "GET_COLLECTION_SNAPSHOT"
-  });
+  const snapshot = await captureVisualPage(tab);
 
   if (snapshot.error) return snapshot;
+
+  latestPageData = { tab, pageData: snapshot };
 
   return {
     tab,
     snapshot: {
-      ...snapshot,
-      tab: {
-        id: tab.id,
-        url: tab.url,
-        title: tab.title
-      }
+      ...snapshot
     }
   };
 }
@@ -461,10 +454,7 @@ async function executeCollectionActions(tabId, actions) {
     addCollectionLog(`Action: ${JSON.stringify(action)}`);
     renderCollectionRun();
 
-    const result = await sendToContentScript(tabId, {
-      type: "RUN_COLLECTION_ACTION",
-      action
-    });
+    const result = await runVisualAction(tabId, action, latestPageData?.pageData);
 
     if (result?.error) {
       collectionRun.warnings.push(result.error);
@@ -579,6 +569,8 @@ async function runCollectionLoop() {
 
   collectionRun.running = false;
   collectionRun.completedAt = Date.now();
+  const activeTab = await getActiveTab();
+  await detachVisualPage(activeTab?.id);
 
   if (collectionRun.stopRequested) {
     collectionRun.stopReason = "stopped_by_user";
@@ -659,7 +651,6 @@ function renderActions() {
   if (!pendingActions.length) {
     actionsBox.style.display = "none";
     actionsBox.textContent = "";
-    runBatchBtn.style.display = "none";
     return;
   }
 
@@ -704,8 +695,6 @@ function renderActions() {
     actionsBox.appendChild(div);
   });
 
-  runBatchBtn.style.display = "inline-block";
-  runBatchBtn.textContent = `Grant Permission and Run Batch (${pendingActions.length})`;
 }
 
 async function getActiveTab() {
@@ -717,14 +706,49 @@ async function getActiveTab() {
   return tabs[0];
 }
 
-async function sendToContentScript(tabId, message) {
+async function sendToBackground(message) {
   try {
-    return await chrome.tabs.sendMessage(tabId, message);
+    return await chrome.runtime.sendMessage(message);
   } catch (error) {
     return {
-      error: "Could not talk to the current page. Refresh the page, then try again. Some Chrome pages cannot be accessed by extensions."
+      error: `Could not control the current tab: ${error.message || "browser connection failed"}.`
     };
   }
+}
+
+function imageDimensions(imageBase64) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve({ imageWidth: image.naturalWidth, imageHeight: image.naturalHeight });
+    image.onerror = () => reject(new Error("Captured screenshot could not be decoded."));
+    image.src = `data:image/png;base64,${imageBase64}`;
+  });
+}
+
+async function captureVisualPage(tab) {
+  const captured = await sendToBackground({ type: "CAPTURE_VISUAL_PAGE", tabId: tab.id });
+  if (captured?.error) return captured;
+  const dimensions = await imageDimensions(captured.imageBase64);
+  return { ...captured, ...dimensions };
+}
+
+async function runVisualAction(tabId, action, context) {
+  return sendToBackground({
+    type: "RUN_VISUAL_ACTION",
+    tabId,
+    action,
+    context: {
+      imageWidth: context?.imageWidth,
+      imageHeight: context?.imageHeight,
+      viewportWidth: context?.viewportWidth,
+      viewportHeight: context?.viewportHeight
+    }
+  });
+}
+
+async function detachVisualPage(tabId) {
+  if (!tabId) return;
+  await sendToBackground({ type: "DETACH_VISUAL_PAGE", tabId });
 }
 
 async function readCurrentPage() {
@@ -734,9 +758,7 @@ async function readCurrentPage() {
     return { error: "No active tab found." };
   }
 
-  const pageData = await sendToContentScript(tab.id, {
-    type: "GET_PAGE_CONTEXT"
-  });
+  const pageData = await captureVisualPage(tab);
 
   if (pageData.error) {
     return pageData;
@@ -1035,8 +1057,7 @@ refreshBtn.addEventListener("click", async () => {
   if (result.error) {
     responseBox.textContent = result.error;
   } else {
-    const count = result.pageData.elements?.length || 0;
-    responseBox.textContent = `Page read successfully. Found ${count} interactive elements.`;
+    responseBox.textContent = `Screenshot captured at ${result.pageData.imageWidth} x ${result.pageData.imageHeight}.`;
   }
 
   setBusy(false);
@@ -1055,7 +1076,7 @@ askBtn.addEventListener("click", async () => {
   actionsBox.style.display = "none";
   pendingActions = [];
   executedActions = [];
-  taskPermissionGranted = false;
+  activeTask = task;
   renderActions();
 
   const result = await readCurrentPage();
@@ -1080,13 +1101,14 @@ askBtn.addEventListener("click", async () => {
     });
 
     responseBox.textContent = data.reply || "No reply.";
-    pendingActions = Array.isArray(data.actions) ? data.actions : [];
+    pendingActions = Array.isArray(data.actions) ? data.actions.slice(0, 1) : [];
 
     if (Array.isArray(data.blockedActions) && data.blockedActions.length) {
       appendResponse(`Blocked actions:\n${JSON.stringify(data.blockedActions, null, 2)}`);
     }
 
     renderActions();
+    if (pendingActions.length) await runPendingActions();
   } catch (error) {
     responseBox.textContent = `Could not complete request: ${error.message}. Make sure the backend is running on ${API_BASE}.`;
   }
@@ -1094,15 +1116,13 @@ askBtn.addEventListener("click", async () => {
   setBusy(false);
 });
 
-runBatchBtn.addEventListener("click", async () => {
+async function runPendingActions() {
   if (!pendingActions.length) {
     renderActions();
     return;
   }
 
-  taskPermissionGranted = true;
-  setBusy(true);
-  appendResponse("Permission granted once for this task batch. Running actions...");
+  appendResponse("Running validated visual actions automatically...");
 
   const tab = await getActiveTab();
 
@@ -1112,32 +1132,85 @@ runBatchBtn.addEventListener("click", async () => {
     return;
   }
 
-  while (pendingActions.length > 0 && taskPermissionGranted) {
-    const action = pendingActions.shift();
+  const fresh = await readCurrentPage();
+  if (fresh.error) {
+    appendResponse(`Could not capture a fresh screenshot before execution: ${fresh.error}`);
+    setBusy(false);
+    return;
+  }
 
-    const result = await sendToContentScript(tab.id, {
-      type: "RUN_ACTION",
-      action
+  try {
+    const replanned = await postJson(`${API_BASE}/agent`, {
+      task: activeTask,
+      provider: providerSelect.value,
+      page: fresh.pageData,
+      priorAction: null,
+      files: agentAttachments()
     });
+    pendingActions = Array.isArray(replanned.actions) ? replanned.actions.slice(0, 1) : [];
+    if (replanned.reply) appendResponse(`Fresh screenshot check: ${replanned.reply}`);
+    if (Array.isArray(replanned.blockedActions) && replanned.blockedActions.length) {
+      appendResponse(`Blocked actions:\n${JSON.stringify(replanned.blockedActions, null, 2)}`);
+    }
+  } catch (error) {
+    appendResponse(`Could not verify the fresh screenshot: ${error.message}`);
+    setBusy(false);
+    return;
+  }
+
+  let visualSteps = 0;
+  while (pendingActions.length > 0 && visualSteps < 50) {
+    const action = pendingActions.shift();
+    const result = await runVisualAction(tab.id, action, latestPageData?.pageData);
 
     executedActions.push({ action, result });
+    visualSteps += 1;
     appendResponse(`Action result:\n${JSON.stringify({ action, result }, null, 2)}`);
 
     if (result && result.error) {
       appendResponse("Stopped because an action failed.");
       break;
     }
+
+    await new Promise(resolve => setTimeout(resolve, action.type === "wait" ? 100 : 700));
+    const observed = await readCurrentPage();
+    if (observed.error) {
+      appendResponse(`Stopped because verification capture failed: ${observed.error}`);
+      break;
+    }
+
+    try {
+      const data = await postJson(`${API_BASE}/agent`, {
+        task: activeTask,
+        provider: providerSelect.value,
+        url: observed.tab.url,
+        title: observed.tab.title,
+        page: observed.pageData,
+        priorAction: { action, result },
+        files: agentAttachments()
+      });
+      if (data.reply) appendResponse(data.reply);
+      if (Array.isArray(data.blockedActions) && data.blockedActions.length) {
+        appendResponse(`Blocked actions:\n${JSON.stringify(data.blockedActions, null, 2)}`);
+      }
+      pendingActions = Array.isArray(data.actions) ? data.actions.slice(0, 1) : [];
+    } catch (error) {
+      appendResponse(`Stopped because visual verification failed: ${error.message}`);
+      break;
+    }
   }
 
+  if (visualSteps >= 50 && pendingActions.length) appendResponse("Stopped at the 50-step visual safety limit.");
+
   renderActions();
-  setBusy(false);
-});
+  await detachVisualPage(tab.id);
+}
 
 clearBtn.addEventListener("click", () => {
   pendingActions = [];
   executedActions = [];
   latestPageData = null;
-  taskPermissionGranted = false;
+  activeTask = "";
   responseBox.textContent = "Ready.";
   actionsBox.textContent = "";
   actionsBox.style.display = "none";

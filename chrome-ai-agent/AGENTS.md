@@ -13,7 +13,7 @@ Follow these rules:
    - `claude_api_key`
    - `openai_signin_codex`
 4. Do not add a domain allowlist. The extension should use `<all_urls>`.
-5. Ask permission once per task/action batch, not before every action.
+5. Do not add task-level permission or approval prompts; validated actions run automatically.
 6. Allow submit actions only when the user explicitly asks to submit/send/post/search/confirm.
 7. Do not type into password, OTP, credit card, CVV/CVC, or secret fields.
 8. Block high-risk irreversible actions such as payment, purchase, financial transfer, crypto transfer, account deletion, or destructive delete/remove actions.

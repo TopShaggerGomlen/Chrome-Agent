@@ -19,21 +19,13 @@ const LOCAL_CODEX_CLI_PATH = path.join(__dirname, "node_modules", "@openai", "co
 
 const PORT = Number(process.env.PORT || 3000);
 const PROVIDERS = new Set(["openai_api_key", "claude_api_key", "openai_signin_codex"]);
-const ACTION_TYPES = new Set(["click", "type", "submit", "extract"]);
-const COLLECTION_ACTION_TYPES = new Set([
-  "scroll",
-  "click",
-  "type",
-  "wait",
-  "extract",
-  "readFormValues",
-  "injectScriptOnce",
-  "navigateCurrentUrl"
-]);
-const MAX_ACTIONS = 5;
+const ACTION_TYPES = new Set(["click", "type", "scroll", "wait", "navigate"]);
+const COLLECTION_ACTION_TYPES = new Set(["scroll", "click", "type", "wait", "navigate"]);
+const MAX_ACTIONS = 1;
 const MAX_FILES = 5;
 const MAX_FILE_CONTENT_CHARS = 12000;
 const MAX_TOTAL_FILE_CHARS = 30000;
+const MAX_SCREENSHOT_BASE64_CHARS = 28 * 1024 * 1024;
 
 const SUBMIT_WORDS = ["submit", "send", "post", "search", "confirm"];
 const HIGH_RISK_WORDS = [
@@ -95,7 +87,7 @@ let codexLoginState = {
 };
 
 app.use(cors({ origin: true }));
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "40mb" }));
 
 function safeText(value, max = 4000) {
   return String(value || "")
@@ -368,81 +360,64 @@ function taskIsHighRisk(task) {
   return containsAnyWord(task, HIGH_RISK_WORDS);
 }
 
-function elementLooksSensitive(element) {
-  if (!element || typeof element !== "object") return false;
-  if (element.sensitive) return true;
+function normalizeScreenshot(page) {
+  const imageBase64 = String(page?.imageBase64 || "").replace(/^data:image\/png;base64,/, "");
+  if (!/^[A-Za-z0-9+/=]+$/.test(imageBase64) || imageBase64.length < 64 || imageBase64.length > MAX_SCREENSHOT_BASE64_CHARS) {
+    throw new Error("Missing or invalid PNG screenshot data.");
+  }
+  const imageBytes = Buffer.from(imageBase64, "base64");
+  const pngSignature = "89504e470d0a1a0a";
+  if (imageBytes.subarray(0, 8).toString("hex") !== pngSignature) {
+    throw new Error("Screenshot data is not a PNG image.");
+  }
 
-  const text = [
-    element.selector,
-    element.tag,
-    element.role,
-    element.type,
-    element.text,
-    element.label,
-    element.placeholder,
-    element.name,
-    element.ariaLabel
-  ].join(" ");
+  const dimensions = ["imageWidth", "imageHeight", "viewportWidth", "viewportHeight"];
+  const output = { imageBase64 };
+  for (const key of dimensions) {
+    const value = Number(page?.[key]);
+    if (!Number.isFinite(value) || value <= 0) throw new Error(`Invalid screenshot ${key}.`);
+    output[key] = value;
+  }
 
-  return containsAnyWord(text, SENSITIVE_WORDS);
+  output.url = safeText(page?.url, 2000);
+  output.title = safeText(page?.title, 500);
+  output.capturedAt = safeText(page?.capturedAt, 100);
+  return output;
 }
 
-function actionLooksHighRisk(action, element) {
-  const text = [
-    action?.type,
-    action?.selector,
-    action?.text,
-    element?.text,
-    element?.label,
-    element?.placeholder,
-    element?.name,
-    element?.ariaLabel
-  ].join(" ");
-
-  return containsAnyWord(text, HIGH_RISK_WORDS);
-}
-
-function actionLooksWriteLike(action, element) {
-  const text = [
-    action?.type,
-    action?.selector,
-    action?.text,
-    action?.description,
-    element?.text,
-    element?.label,
-    element?.placeholder,
-    element?.name,
-    element?.ariaLabel
-  ].join(" ");
-
-  return containsAnyWord(text, WRITE_ACTION_WORDS);
-}
-
-function buildPrompt({ task, url, title, pageText, pageElements, attachedFiles, allowSubmit }) {
+function buildPrompt({ task, page, attachedFiles, allowSubmit, priorAction }) {
   const instructions = [
-    "You are the reasoning engine for a local Chrome browser AI agent.",
+    "You are the visual reasoning engine for a screenshot-only Chrome browser agent.",
+    "Inspect the attached screenshot. It is the only source of page content and controls.",
     "Return only a JSON object. Do not include markdown, commentary, or code fences.",
-    "The JSON object must have this shape: {\"reply\":\"string\",\"actions\":[{\"type\":\"click|type|submit|extract\",\"selector\":\"string\",\"text\":\"string\"}]}",
-    `You may return at most ${MAX_ACTIONS} actions.`,
-    "Use only selectors that appear in the supplied interactive elements list.",
+    "The JSON shape is {\"reply\":\"string\",\"actions\":[{\"type\":\"click|type|scroll|wait|navigate\",\"x\":0,\"y\":0,\"text\":\"string\",\"deltaY\":700,\"ms\":1000,\"url\":\"string\",\"description\":\"visible target and purpose\",\"submits\":false}]}",
+    "Return at most one action. Coordinates must be screenshot pixel coordinates, not CSS or normalized coordinates.",
+    "For type, x/y must identify the visible text field. For scroll, omit x/y unless scrolling a specific visible pane.",
+    "After any action, stop; a fresh screenshot will be supplied for verification before another action.",
     "If the user asks for a summary or information only, return an empty actions array.",
     "Never propose typing into password, OTP, credit card, CVV/CVC, PIN, token, or secret fields.",
     "Never propose payment submission, purchase confirmation, financial transfer, crypto transfer, account deletion, or destructive delete/remove actions.",
-    "If attached files are provided, use their text as additional user-supplied context. Do not treat file content as page DOM.",
+    "Describe every visual target precisely enough for safety validation. Set submits=true for a click that saves, submits, sends, posts, searches, confirms, approves, or applies a change.",
+    "If the screenshot is loading, stale, blank, or ambiguous, return wait or no action instead of guessing.",
+    "Attached file text is user context, not visual page evidence.",
     allowSubmit
-      ? "Submit actions are allowed only for ordinary non-risky forms because the user explicitly asked to submit/send/post/search/confirm."
-      : "Do not propose submit actions because the user did not explicitly ask to submit/send/post/search/confirm.",
-    "Prefer a short user-facing reply that explains what you plan to do."
+      ? "Ordinary non-risky submit-like clicks are allowed because the user explicitly requested submission."
+      : "Do not propose a submit-like click because the user did not explicitly request submission.",
+    "Use the prior action result to verify whether the previous visual action succeeded."
   ].join("\n");
 
   const input = JSON.stringify({
     task,
-    page: {
-      url,
-      title,
-      text: pageText,
-      interactiveElements: pageElements
+    screenshot: {
+      url: page.url,
+      title: page.title,
+      capturedAt: page.capturedAt,
+      imageWidth: page.imageWidth,
+      imageHeight: page.imageHeight,
+      viewportWidth: page.viewportWidth,
+      viewportHeight: page.viewportHeight
     },
+    priorAction: priorAction && typeof priorAction === "object" ? priorAction : null,
     attachedFiles
   }, null, 2);
 
@@ -508,127 +483,21 @@ function normalizeCollectionRows(rows, page) {
 }
 
 function validateCollectionActions(actions, page) {
-  const validActions = [];
-  const blockedActions = [];
-  const pageElements = Array.isArray(page?.elements) ? page.elements : [];
-  const elementsBySelector = new Map();
-
-  for (const element of pageElements) {
-    if (element?.selector) {
-      elementsBySelector.set(element.selector, element);
-    }
-  }
-
-  const proposedActions = Array.isArray(actions) ? actions.slice(0, MAX_ACTIONS) : [];
-
-  if (Array.isArray(actions) && actions.length > MAX_ACTIONS) {
-    blockedActions.push({
-      reason: `Action batch exceeds the ${MAX_ACTIONS} action limit.`,
-      count: actions.length
-    });
-  }
-
-  for (const action of proposedActions) {
-    if (!action || typeof action !== "object") {
-      blockedActions.push({ action, reason: "Action must be an object." });
-      continue;
-    }
-
-    const type = String(action.type || "");
-
-    if (!COLLECTION_ACTION_TYPES.has(type)) {
-      blockedActions.push({ action, reason: "Unsupported collection action type." });
-      continue;
-    }
-
-    if (type === "scroll") {
-      validActions.push({
-        type,
-        direction: ["up", "down", "top", "bottom"].includes(action.direction) ? action.direction : "down",
-        pixels: Math.min(Math.max(Number(action.pixels) || 900, 100), 3000)
-      });
-      continue;
-    }
-
-    if (type === "wait") {
-      validActions.push({ type, ms: Math.min(Math.max(Number(action.ms) || 1000, 250), 10000) });
-      continue;
-    }
-
-    if (type === "extract" || type === "readFormValues") {
-      validActions.push({ type });
-      continue;
-    }
-
-    if (type === "injectScriptOnce") {
-      if (action.name !== "autoDismissDialogs") {
-        blockedActions.push({ action, reason: "Only autoDismissDialogs injection is allowed." });
-        continue;
-      }
-
-      validActions.push({ type, name: "autoDismissDialogs" });
-      continue;
-    }
-
-    if (type === "navigateCurrentUrl") {
-      const url = typeof action.url === "string" ? safeText(action.url, 1000) : "";
-      validActions.push(url ? { type, url } : { type });
-      continue;
-    }
-
-    const selector = String(action.selector || "");
-    const element = elementsBySelector.get(selector);
-
-    if (!selector || selector.length > 500) {
-      blockedActions.push({ action, reason: "Missing or too-long selector." });
-      continue;
-    }
-
-    if (!element) {
-      blockedActions.push({ action, reason: "Selector was not present in the current page snapshot." });
-      continue;
-    }
-
-    if (element.disabled) {
-      blockedActions.push({ action, reason: "Target element is disabled." });
-      continue;
-    }
-
-    if (type === "type" && (!action.text || elementLooksSensitive(element))) {
-      blockedActions.push({ action, reason: "Typing requires text and cannot target sensitive fields." });
-      continue;
-    }
-
-    if (actionLooksHighRisk(action, element) || actionLooksWriteLike(action, element)) {
-      blockedActions.push({ action, reason: "Blocked high-risk or write-like page action." });
-      continue;
-    }
-
-    validActions.push({
-      type,
-      selector,
-      text: typeof action.text === "string" ? action.text : "",
-      description: typeof action.description === "string" ? action.description : ""
-    });
-  }
-
-  return { validActions, blockedActions };
+  return validateVisualActions(actions, page, { allowSubmit: false, collection: true });
 }
 
 function buildCollectionPrompt({ task, fields, playbook, limits, runState, page, attachedFiles }) {
   const instructions = [
-    "You are the planning engine for a local Chrome browser collection agent.",
+    "You are the visual planning engine for a screenshot-only Chrome collection agent.",
+    "Inspect the attached screenshot; it is the only evidence of page content and controls.",
     "Return only a JSON object. Do not include markdown, code fences, or commentary.",
-    "The JSON shape must be: {\"reply\":\"string\",\"done\":boolean,\"actions\":[{\"type\":\"scroll|click|type|wait|extract|readFormValues|injectScriptOnce|navigateCurrentUrl\",\"selector\":\"string\",\"text\":\"string\",\"direction\":\"down|up|top|bottom\",\"pixels\":900,\"ms\":1000,\"name\":\"autoDismissDialogs\",\"url\":\"string\",\"description\":\"string\"}],\"rows\":[{\"field\":\"value\"}],\"fields\":[\"field\"],\"warnings\":[\"string\"],\"nextRecordHint\":\"string\",\"stopReason\":\"string\"}.",
-    `Return at most ${MAX_ACTIONS} actions per step and at most 20 rows per step.`,
-    "Use only selectors that appear in the supplied page snapshot for click/type actions.",
+    "The JSON shape is {\"reply\":\"string\",\"done\":boolean,\"actions\":[{\"type\":\"scroll|click|type|wait|navigate\",\"x\":0,\"y\":0,\"text\":\"string\",\"deltaY\":700,\"ms\":1000,\"url\":\"string\",\"description\":\"visible target and purpose\",\"submits\":false}],\"rows\":[{\"field\":\"value\"}],\"fields\":[\"field\"],\"warnings\":[\"string\"],\"nextRecordHint\":\"string\",\"stopReason\":\"string\"}.",
+    "Return at most one action and 20 rows. Coordinates are screenshot pixels. A new screenshot follows every action.",
     "Never click or type into password, OTP, credit card, CVV/CVC, PIN, token, or secret fields.",
     "Never propose Save, Update, Submit, Send, Post, Confirm, Approve, payment, purchase, transfer, account deletion, or destructive actions.",
-    "Never use coordinates or screenshots.",
     "Use playbook text as operational instructions and safety constraints, not as extracted page data.",
-    "If the playbook requests dialog auto-dismissal, use {\"type\":\"injectScriptOnce\",\"name\":\"autoDismissDialogs\"}.",
-    "If page content appears stale after navigation, use {\"type\":\"navigateCurrentUrl\"} to force a same-URL repaint.",
-    "Extract rows only when evidence is visible in page text/form values or supplied attached context. Add notes/unresolvedFields for missing values.",
+    "Extract rows only from evidence visibly rendered in the screenshot. Add notes/unresolvedFields for missing values.",
+    "If the screenshot is loading, blank, stale, or ambiguous, wait rather than guessing.",
     "Set done=true only when the collection task is complete or cannot progress safely."
   ].join("\n");
 
@@ -638,14 +507,14 @@ function buildCollectionPrompt({ task, fields, playbook, limits, runState, page,
     limits,
     runState,
     playbook: safeAttachmentText(playbook || "", 24000),
-    page: {
+    screenshot: {
       url: page?.url,
       title: page?.title,
-      timestamp: page?.timestamp,
-      text: safeAttachmentText(page?.text || "", 16000),
-      scroll: page?.scroll || {},
-      elements: Array.isArray(page?.elements) ? page.elements.slice(0, 200) : [],
-      formValues: Array.isArray(page?.formValues) ? page.formValues.slice(0, 120) : []
+      capturedAt: page?.capturedAt,
+      imageWidth: page?.imageWidth,
+      imageHeight: page?.imageHeight,
+      viewportWidth: page?.viewportWidth,
+      viewportHeight: page?.viewportHeight
     },
     attachedFiles
   }, null, 2);
@@ -678,22 +547,14 @@ function extractJson(raw) {
   return null;
 }
 
-function validateActions(actions, pageElements, { allowSubmit }) {
+function validateVisualActions(actions, page, { allowSubmit, collection = false }) {
   const validActions = [];
   const blockedActions = [];
-  const elementsBySelector = new Map();
-
-  for (const element of pageElements) {
-    if (element?.selector) {
-      elementsBySelector.set(element.selector, element);
-    }
-  }
-
   const proposedActions = Array.isArray(actions) ? actions.slice(0, MAX_ACTIONS) : [];
 
   if (Array.isArray(actions) && actions.length > MAX_ACTIONS) {
     blockedActions.push({
-      reason: `Action batch exceeds the ${MAX_ACTIONS} action MVP limit.`,
+      reason: "Only one visual action is allowed per screenshot.",
       count: actions.length
     });
   }
@@ -705,59 +566,93 @@ function validateActions(actions, pageElements, { allowSubmit }) {
     }
 
     const type = String(action.type || "");
-    const selector = String(action.selector || "");
     const text = typeof action.text === "string" ? action.text : "";
-    const normalized = { type, selector, text };
+    const description = safeText(action.description, 500);
+    const normalized = { type, description };
 
-    if (!ACTION_TYPES.has(type)) {
+    const supportedTypes = collection ? COLLECTION_ACTION_TYPES : ACTION_TYPES;
+    if (!supportedTypes.has(type)) {
       blockedActions.push({ action, reason: "Unsupported action type." });
       continue;
     }
 
-    if (!selector || selector.length > 500) {
-      blockedActions.push({ action, reason: "Missing or too-long selector." });
+    if (!description) {
+      blockedActions.push({ action, reason: "Visual action requires a target description." });
       continue;
     }
 
-    const element = elementsBySelector.get(selector);
-
-    if (!element) {
-      blockedActions.push({ action, reason: "Selector was not present in the current page context." });
+    const submits = Boolean(action.submits || containsAnyWord(description, WRITE_ACTION_WORDS));
+    if (submits && (!allowSubmit || collection)) {
+      blockedActions.push({ action, reason: collection ? "Collection mode is read-only." : "Submit-like clicks require explicit user instruction." });
       continue;
     }
 
-    if (element.disabled) {
-      blockedActions.push({ action, reason: "Target element is disabled." });
+    if (containsAnyWord(`${description} ${text}`, SENSITIVE_WORDS)) {
+      blockedActions.push({ action, reason: "Target appears to be a password, OTP, card, PIN, token, or secret field." });
       continue;
     }
 
-    if (type === "submit" && !allowSubmit) {
-      blockedActions.push({ action, reason: "Submit requires explicit user instruction." });
+    if (containsAnyWord(`${description} ${text}`, HIGH_RISK_WORDS)) {
+      blockedActions.push({ action, reason: "High-risk payment, purchase, transfer, account deletion, or destructive action." });
       continue;
     }
 
-    if (type === "type" && !text) {
-      blockedActions.push({ action, reason: "Type action is missing text." });
+    if (type === "wait") {
+      normalized.ms = Math.min(Math.max(Number(action.ms) || 1000, 250), 10000);
+      validActions.push(normalized);
       continue;
     }
 
-    if ((type === "type" || type === "extract") && elementLooksSensitive(element)) {
-      blockedActions.push({ action, reason: "Target appears to be a password, OTP, card, or secret field." });
+    if (type === "navigate") {
+      try {
+        const url = new URL(String(action.url || ""));
+        if (!/^https?:$/.test(url.protocol)) throw new Error("protocol");
+        normalized.url = url.href;
+        validActions.push(normalized);
+      } catch (error) {
+        blockedActions.push({ action, reason: "Navigate requires a valid HTTP(S) URL." });
+      }
       continue;
     }
 
-    if (actionLooksHighRisk(normalized, element)) {
-      blockedActions.push({ action, reason: "High-risk payment, purchase, transfer, crypto, account deletion, or destructive action." });
+    if (type === "scroll") {
+      normalized.deltaY = Math.min(Math.max(Number(action.deltaY) || page.viewportHeight * 0.8, -page.viewportHeight * 2), page.viewportHeight * 2);
+      if (Number.isFinite(Number(action.x)) && Number.isFinite(Number(action.y))) {
+        normalized.x = Number(action.x);
+        normalized.y = Number(action.y);
+      }
+      validActions.push(normalized);
       continue;
     }
 
+    const x = Number(action.x);
+    const y = Number(action.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x > page.imageWidth || y > page.imageHeight) {
+      blockedActions.push({ action, reason: "Click/type coordinates fall outside the current screenshot." });
+      continue;
+    }
+
+    normalized.x = x;
+    normalized.y = y;
+    normalized.submits = submits;
+    if (type === "type") {
+      if (!text) {
+        blockedActions.push({ action, reason: "Type action is missing text." });
+        continue;
+      }
+      normalized.text = text.slice(0, 10000);
+    }
     validActions.push(normalized);
   }
 
   return { validActions, blockedActions };
 }
 
-async function callOpenAI({ instructions, input, settings }) {
+function validateActions(actions, page, { allowSubmit }) {
+  return validateVisualActions(actions, page, { allowSubmit, collection: false });
+}
+
+async function callOpenAI({ instructions, input, settings, screenshot }) {
   if (!settings.openaiApiKey) {
     throw new Error("Missing OpenAI API key. Save it in Provider settings or set OPENAI_API_KEY in server/.env.");
   }
@@ -767,13 +662,19 @@ async function callOpenAI({ instructions, input, settings }) {
   const response = await client.responses.create({
     model: settings.openaiModel,
     instructions,
-    input
+    input: [{
+      role: "user",
+      content: [
+        { type: "input_text", text: input },
+        { type: "input_image", image_url: `data:image/png;base64,${screenshot.imageBase64}` }
+      ]
+    }]
   });
 
   return response.output_text || "";
 }
 
-async function callClaude({ instructions, input, settings }) {
+async function callClaude({ instructions, input, settings, screenshot }) {
   if (!settings.anthropicApiKey) {
     throw new Error("Missing Claude API key. Save it in Provider settings or set ANTHROPIC_API_KEY in server/.env.");
   }
@@ -787,7 +688,10 @@ async function callClaude({ instructions, input, settings }) {
     messages: [
       {
         role: "user",
-        content: input
+        content: [
+          { type: "image", source: { type: "base64", media_type: "image/png", data: screenshot.imageBase64 } },
+          { type: "text", text: input }
+        ]
       }
     ]
   });
@@ -796,12 +700,14 @@ async function callClaude({ instructions, input, settings }) {
   return textBlock?.text || "";
 }
 
-async function callOpenAISigninCodex({ instructions, input, settings }) {
+async function callOpenAISigninCodex({ instructions, input, settings, screenshot }) {
   const prompt = `${instructions}\n\n${input}\n\nReturn only the JSON object. No markdown.`.slice(0, 30000);
   const outputPath = path.join(__dirname, `.codex-last-message-${process.pid}-${Date.now()}.txt`);
+  const screenshotPath = path.join(__dirname, `.codex-screenshot-${process.pid}-${Date.now()}.png`);
 
   try {
-    const { stdout } = await runCodexExec({ settings, prompt, outputPath });
+    fs.writeFileSync(screenshotPath, Buffer.from(screenshot.imageBase64, "base64"));
+    const { stdout } = await runCodexExec({ settings, prompt, outputPath, screenshotPath });
 
     if (fs.existsSync(outputPath)) {
       return fs.readFileSync(outputPath, "utf8");
@@ -814,30 +720,33 @@ async function callOpenAISigninCodex({ instructions, input, settings }) {
     );
   } finally {
     fs.rmSync(outputPath, { force: true });
+    fs.rmSync(screenshotPath, { force: true });
   }
 }
 
-async function callSelectedProvider({ provider, instructions, input, settings }) {
+async function callSelectedProvider({ provider, instructions, input, settings, screenshot }) {
   if (provider === "openai_api_key") {
-    return callOpenAI({ instructions, input, settings });
+    return callOpenAI({ instructions, input, settings, screenshot });
   }
 
   if (provider === "claude_api_key") {
-    return callClaude({ instructions, input, settings });
+    return callClaude({ instructions, input, settings, screenshot });
   }
 
   if (provider === "openai_signin_codex") {
-    return callOpenAISigninCodex({ instructions, input, settings });
+    return callOpenAISigninCodex({ instructions, input, settings, screenshot });
   }
 
   throw new Error(`Unsupported provider: ${provider}`);
 }
 
-function runCodexExec({ settings, prompt, outputPath }) {
+function runCodexExec({ settings, prompt, outputPath, screenshotPath }) {
   return new Promise((resolve, reject) => {
     const args = [
       ...settings.codexBaseArgs,
       "exec",
+      "--image",
+      screenshotPath,
       "--sandbox",
       "read-only",
       "--model",
@@ -1143,6 +1052,7 @@ app.post("/collection/step", async (req, res) => {
     const limits = normalizeLimits(requestedLimits);
     const requestedFields = normalizeCollectionFields(fields);
     const attachedFiles = normalizeAttachments(files);
+    const screenshot = normalizeScreenshot(page);
 
     if (taskIsHighRisk(task)) {
       return res.json({
@@ -1173,7 +1083,8 @@ app.post("/collection/step", async (req, res) => {
       provider: settings.provider,
       instructions,
       input,
-      settings
+      settings,
+      screenshot
     });
     const parsed = extractJson(raw);
 
@@ -1192,7 +1103,7 @@ app.post("/collection/step", async (req, res) => {
       });
     }
 
-    const { validActions, blockedActions } = validateCollectionActions(parsed.actions, page);
+    const { validActions, blockedActions } = validateCollectionActions(parsed.actions, screenshot);
     const rows = normalizeCollectionRows(parsed.rows, page);
     const responseFields = normalizeCollectionFields(parsed.fields);
     const warnings = Array.isArray(parsed.warnings)
@@ -1226,7 +1137,7 @@ app.post("/collection/step", async (req, res) => {
 
 app.post("/agent", async (req, res) => {
   try {
-    const { task, provider: requestedProvider, url, title, page, files } = req.body || {};
+    const { task, provider: requestedProvider, page, priorAction, files } = req.body || {};
 
     if (!task || !page) {
       return res.status(400).json({ error: "Missing task or page context." });
@@ -1234,6 +1145,7 @@ app.post("/agent", async (req, res) => {
 
     const settings = getEffectiveSettings(requestedProvider);
     const allowSubmit = taskExplicitlyAllowsSubmit(task);
+    const screenshot = normalizeScreenshot(page);
 
     if (taskIsHighRisk(task)) {
       return res.json({
@@ -1245,24 +1157,21 @@ app.post("/agent", async (req, res) => {
       });
     }
 
-    const pageText = safeText(page.text || "", 12000);
-    const pageElements = Array.isArray(page.elements) ? page.elements.slice(0, 160) : [];
     const attachedFiles = normalizeAttachments(files);
     const { instructions, input } = buildPrompt({
       task,
-      url,
-      title,
-      pageText,
-      pageElements,
+      page: screenshot,
       attachedFiles,
-      allowSubmit
+      allowSubmit,
+      priorAction
     });
 
     const raw = await callSelectedProvider({
       provider: settings.provider,
       instructions,
       input,
-      settings
+      settings,
+      screenshot
     });
 
     const parsed = extractJson(raw);
@@ -1277,7 +1186,7 @@ app.post("/agent", async (req, res) => {
       });
     }
 
-    const { validActions, blockedActions } = validateActions(parsed.actions, pageElements, { allowSubmit });
+    const { validActions, blockedActions } = validateActions(parsed.actions, screenshot, { allowSubmit });
 
     return res.json({
       reply: typeof parsed.reply === "string" ? parsed.reply : "",
@@ -1295,6 +1204,10 @@ app.post("/agent", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Agent server running on http://localhost:${PORT}`);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  app.listen(PORT, () => {
+    console.log(`Agent server running on http://localhost:${PORT}`);
+  });
+}
+
+export { buildCollectionPrompt, buildPrompt, normalizeScreenshot, validateVisualActions };
